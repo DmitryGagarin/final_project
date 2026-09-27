@@ -1,0 +1,546 @@
+================================================================================
+FINANCIAL ADVISOR BOT - INSTRUCTIONS
+================================================================================
+
+CONTENTS
+  1. Overview
+  2. System requirements
+  3. Installation
+  4. First-time data build
+  5. Training the summariser
+  6. Training the RL agent
+  7. Running the web interface
+  8. Using the web interface
+  9. Evaluation scripts
+ 10. Module reference
+ 11. Data files reference
+ 12. Environment variables
+ 13. Troubleshooting
+ 14. Known limitations
+
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+This project is an end-to-end financial advisor bot. It ingests financial
+commentary from several text sources, summarises it with a fine-tuned
+LoRA-T5 model, extracts a ticker and a directional signal, consults a
+technical indicator (RSI) and optionally a reinforcement-learning agent,
+and produces a natural-language recommendation through a local Ollama
+language model with a deterministic template fallback.
+
+The system has four layers:
+
+  Data layer        Scrapers and downloaders that build CSV corpora.
+  NLP layer         LoRA-T5 summariser and FinBERT sentiment classifier.
+  Decision layer    Rule-based advisor plus a confidence-gated DQN agent.
+  Presentation      Streamlit web interface plus local LLM explanation.
+
+Every layer is replaceable in isolation. The interfaces between layers are
+plain Python functions and CSV or PKL files.
+
+
+================================================================================
+2. SYSTEM REQUIREMENTS
+================================================================================
+
+  Python 3.10 or later.
+  MacOS with Apple Silicon (MPS) recommended; CPU works but is slower.
+  At least 16 GB RAM for training; 8 GB is the minimum for inference.
+  About 5 GB free disk space for models, corpora, and logs.
+  Optional: Ollama installed locally for LLM-based explanations.
+  Optional: SOCKS5 proxy on 127.0.0.1:10808 if you want to scrape Telegram.
+
+
+================================================================================
+3. INSTALLATION
+================================================================================
+
+  Step 1. Create and activate a virtual environment:
+
+    python3 -m venv .venv
+    source .venv/bin/activate
+
+  Step 2. Install Python dependencies:
+
+    pip install -r requirements.txt
+
+  The requirements file must include at least:
+
+    streamlit
+    pandas
+    numpy
+    torch
+    transformers
+    datasets
+    peft
+    evaluate
+    rouge_score
+    backtrader
+    matplotlib
+    seaborn
+    yfinance
+    finnhub-python
+    feedparser
+    requests
+    gymnasium
+    tqdm
+    langdetect            (only if you enable English filtering)
+
+  Step 3. Optional: install Ollama and pull a model.
+
+    brew install ollama
+    ollama serve
+    ollama pull llama3.2:1b
+
+  Step 4. Verify that the environment imports cleanly:
+
+    python -c "import torch, transformers, streamlit; print('ok')"
+
+
+================================================================================
+4. FIRST-TIME DATA BUILD
+================================================================================
+
+You only need to run these once, and only the sources you care about.
+
+  Finnhub news corpus:
+
+    python build_corpus.py
+
+    Writes eulerpool_corpus.csv. Requires a Finnhub API key. The key is
+    currently hard-coded in build_corpus.py. Move it to the FINNHUB_KEY
+    environment variable before publishing.
+
+  RSS news corpus:
+
+    python build_rss_corpus.py
+
+    Writes rss_corpus.csv. No API key required. Each feed has a hard
+    per-request timeout so the script never hangs.
+
+  HuggingFace corpus (optional, may include non-English rows):
+
+    python build_hf_corpus.py
+
+    Writes hf_telegram_corpus.csv. If you want English-only data, edit
+    the DATASETS list or add a langdetect filter as described in the
+    project report.
+
+  Gold evaluation set:
+
+    python build_gold_set.py
+
+    Writes gold_set_v2.csv. Uses a disjoint ticker set from the training
+    corpus so no row overlaps with training data.
+
+  Merge all sources into one training file:
+
+    python merge_corpora.py
+
+    Reads every file listed in its SOURCES dict and writes
+    training_corpus_large.csv. Rows shorter than 50 characters of text
+    or 10 characters of summary are dropped, and duplicate texts are
+    removed.
+
+  Optional: scrape Telegram channels.
+
+    python scraper.py
+
+    Or run from the web interface. Requires the telethon package, a
+    valid Telegram session file, and the SOCKS5 proxy on 127.0.0.1:10808.
+
+
+================================================================================
+5. TRAINING THE SUMMARISER
+================================================================================
+
+You can train from the command line or from the web interface.
+
+  Command line:
+
+    python -c "from train_model import train_english_lora; \
+               train_english_lora('training_corpus_large.csv', \
+                 {'r':16,'alpha':32,'dropout':0.10, \
+                  'learning_rate':5e-4,'num_epochs':3,'batch_size':2}, \
+                 model_name='expanded_v1', notes='first run')"
+
+  Web interface:
+
+    1. Start the app (section 7).
+    2. Scroll to "Train New Model" and expand it.
+    3. Enter a unique model name. Existing names are rejected.
+    4. Optionally enter notes.
+    5. Set the hyperparameters. Defaults are r=16, alpha=32, dropout=0.10,
+       learning_rate=5e-4, epochs=3, batch=2.
+    6. Click "Start Training". The log panel appears underneath.
+    7. When training finishes, the model is registered under the name you
+       chose and appears in the Model Registry.
+
+  Outputs:
+
+    models/english_lora_<timestamp>/merged/      the final merged model
+    models/english_lora_<timestamp>/metrics.json validation metrics
+    models/english_lora_<timestamp>/plots/       training curves
+    models/registry.json                         named-model index
+    training_logs/<run_id>/                      per-epoch metrics
+    logs/training_log_<timestamp>.csv            step-level log
+
+  Training is incremental and interruptible. The web interface writes a
+  flag file to logs/ so the training state survives a browser refresh.
+
+
+================================================================================
+6. TRAINING THE RL AGENT
+================================================================================
+
+  Prerequisites: a trained summariser registered in the model registry,
+  and at least one corpus in eulerpool_corpus.csv or rss_corpus.csv.
+
+  Web interface:
+
+    1. In Step 1, select a summarisation model.
+    2. In the sidebar under "RL Agent Training", click "Train RL Agent".
+    3. The RL log panel appears. Wait for completion.
+
+  Command line:
+
+    python train_rl_agent.py
+
+  Outputs:
+
+    dqn_model.pth                the trained Q-network
+    rl_train_set.pkl             training split used during training
+    rl_test_set.pkl              held-out test split
+    rl_main_ticker.txt           the ticker chosen as primary asset
+    rl_training_metrics.json     backtest results on the test split
+    logs/rl_training_output.log  full stdout log
+
+  The agent conditions on a seven-dimensional state: returns, RSI, MACD,
+  price relative to SMA-20, price relative to SMA-50, volume ratio, and
+  a composite signal in {-1, 0, +1} derived from analyst keywords and
+  FinBERT sentiment.
+
+
+================================================================================
+7. RUNNING THE WEB INTERFACE
+================================================================================
+
+  From the project root:
+
+    streamlit run app.py
+
+  Streamlit opens the app at http://localhost:8501 in your browser.
+
+  Optional environment variables before launch:
+
+    export OLLAMA_URL=http://localhost:11434
+    export OLLAMA_MODEL=llama3.2:1b
+    export ENABLE_TELEGRAM=0        set to 1 to show the Telegram panel
+
+
+================================================================================
+8. USING THE WEB INTERFACE
+================================================================================
+
+The interface is a vertical sequence of expandable sections.
+
+  Sidebar - Configuration
+    Recommendation Engine. Choose Rule-Based for a fully explainable
+      decision, or Reinforcement Learning to consult the DQN agent with
+      a fallback threshold.
+    RL confidence threshold. If the top two Q-values differ by less than
+      this value, the rule-based advisor is used instead. Default 0.05.
+    Explanation Generator. If Ollama is running, pick a model and tick
+      "Use LLM for explanations". Otherwise template explanations are used.
+    RL Agent Training. Shows the current agent status, allows deletion,
+      and starts background RL training.
+    Corpus Inventory. Shows the row count of every corpus file that the
+      app can load.
+
+  Model Registry
+    Lists every named model with its hyperparameters and validation
+      metrics. You can rename an entry, remove it while keeping the files
+      on disk, or remove it and delete the run directory. A JSON view of
+      the selected entry is shown beneath the table.
+
+  Step 1 - Choose a primary summarisation model
+    Click one of the model buttons. The selected model is loaded into
+    memory and its registry metrics are displayed.
+
+  Step 1b - Evaluate selected model on a gold set
+    "Run point-estimate ROUGE" produces ROUGE-1, ROUGE-2, and ROUGE-L on
+      the gold set.
+    "Run with bootstrap 95% CIs" additionally computes a two-hundred-sample
+      bootstrap confidence interval for each metric.
+    Results are saved to the model's registry entry automatically.
+
+  Evaluation Suite
+    Ablation tab. Runs ablation.py, which compares four pipeline
+      configurations on the held-out test split.
+    Walk-forward tab. Runs walkforward.py, which retrains the RL agent
+      on four expanding windows and reports mean and std of return,
+      Sharpe, and maximum drawdown across folds.
+    RL comparison tab. Runs evaluate_rl.py, which compares the RL agent
+      against buy-and-hold, rule-based, signal-only, and a random policy,
+      and plots equity curves.
+
+  Corpus Maintenance
+    Clean a corpus in place. URLs-only rows, non-English rows,
+      rows shorter than the configured minimums, and duplicate texts are
+      removed. A backup is written next to the file on the first run.
+    Create a subset. Writes training_corpus_small.csv with a random
+      sample of the chosen size.
+
+  Train New Model
+    See section 5 for the field-by-field walk-through. The "Force reset"
+      button unsticks the UI if a training job crashes without removing
+      its flag file.
+
+  Training History Dashboard
+    Reads training_logs/ and shows every run's id, hyperparameters,
+      duration, and status.
+
+  Scrape Telegram posts (optional)
+    Only shown if ENABLE_TELEGRAM=1. Starts the scraper in a background
+      thread and reports rows saved per channel.
+
+  Step 2 - Analyse a random corpus sample
+    Pick a source, click "Load Random Sample", and the pipeline runs from
+      summarisation through ticker extraction, market-data fetch, decision
+      (rule-based or RL), and explanation. The chosen engine and the
+      explanation source are shown below the recommendation.
+
+
+================================================================================
+9. EVALUATION SCRIPTS
+================================================================================
+
+Every script can be run from the command line or from the web interface
+Evaluation Suite. Each writes a CSV to the project root and prints a
+summary to stdout.
+
+  ablation.py
+    Compares four configurations on rl_test_set.pkl. Writes
+    ablation_results.csv. Configurations are:
+      A  no signal
+      B  composite signal filtered by the RSI rule
+      C  composite signal without the RSI filter
+      D  full pipeline including the RL agent
+
+  walkforward.py
+    Four expanding folds, retraining the agent from scratch each time.
+    Writes walkforward_results.csv.
+
+  evaluate_rl.py
+    Compares the trained agent against four baselines on rl_test_set.pkl.
+    Writes rl_comparison.csv and rl_equity_curves.png.
+
+  visualise_training_logs.py
+    Optional. Reads logs/training_log_*.csv and draws training and
+    validation curves. Useful for report figures. Not used by the app.
+
+
+================================================================================
+10. MODULE REFERENCE
+================================================================================
+
+DATA INGESTION
+  build_corpus.py         Finnhub news downloader for eighty tickers.
+  build_rss_corpus.py     RSS feed downloader for nine global feeds and
+                          fifty-eight per-ticker feeds.
+  build_hf_corpus.py      HuggingFace dataset loader with column auto-detect
+                          and a summary sanity check.
+  build_gold_set.py       Builds a held-out gold set from disjoint tickers.
+  merge_corpora.py        Merges the above into training_corpus_large.csv.
+
+NLP AND SIGNALS
+  summarizer.py           Summariser wrapper, ticker extraction, and the
+                          model path management for the current summariser.
+                          Public functions: summarize_post, extract_signal,
+                          set_model_path.
+  finbert_signal.py       FinBERT sentiment wrapper. Returns a signed value
+                          in {-1, 0, +1} and a confidence score.
+  train_model.py          LoRA-T5 training loop. Registers the resulting
+                          model in models/registry.json under a given name.
+
+MARKET DATA
+  market_data.py          yfinance downloader plus the feature-engineering
+                          step that adds returns, RSI, MACD, SMA-20,
+                          SMA-50, and volume ratio.
+  market_data_providers.py Provider abstraction. yfinance is the default;
+                          Alpha Vantage and Twelve Data are optional.
+
+DECISION
+  advisor.py              Rule-based advisor. Takes analyst action and RSI,
+                          returns a BUY, SELL, or HOLD recommendation plus
+                          a one-sentence explanation.
+  RL/rl_agent.py          DQN implementation. Exposes remember, act,
+                          replay, save, load.
+  RL/rl_env.py            Gymnasium trading environment. State is a
+                          seven-dimensional vector; actions are hold, buy,
+                          sell; reward is step-wise percentage change in
+                          portfolio value.
+  RL/backtest.py          Backtrader wrapper used by ablation and training.
+  train_rl_agent.py       RL training loop. Reads corpus signals, aligns
+                          them to trading days, splits eighty-twenty, and
+                          trains for thirty episodes.
+
+EVALUATION
+  ablation.py             Four-configuration ablation on the test split.
+  walkforward.py          Walk-forward validation across four folds.
+  evaluate_rl.py          Strategy comparison against four baselines.
+  plot_utils.py           Generates training curves from a run's log.
+  training_logger.py      Persists per-epoch metrics to JSON and CSV.
+
+EXPLANATION
+  llm_advisor.py          Local Ollama wrapper with a deterministic
+                          template fallback.
+
+WEB INTERFACE
+  app.py                  Streamlit application. Wires everything together.
+  model_registry.py       Named-model registry. JSON-backed, atomic writes,
+                          uniqueness enforcement, and safe deletion.
+
+UTILITIES
+  utils/utils.py          Text cleaning and named-model discovery.
+  scraper.py              Telegram scraper. Optional. Kept in
+                          telegram_legacy/ if you move it.
+
+
+================================================================================
+11. DATA FILES REFERENCE
+================================================================================
+
+CORPORA
+  eulerpool_corpus.csv          Finnhub news, columns: ticker, headline,
+                                content, published, source, url.
+  rss_corpus.csv                RSS feed entries, same schema.
+  hf_telegram_corpus.csv        HuggingFace Telegram corpus, columns:
+                                cleaned_text, summary.
+  training_corpus_large.csv     Merged corpus, columns: cleaned_text,
+                                summary.
+  training_corpus_small.csv     Optional subset for quick experiments.
+
+EVALUATION
+  gold_set_v2.csv               Held-out gold set, columns: cleaned_text,
+                                summary, ticker, published, source.
+  filtered_telegram_gold.csv    Legacy gold set from Telegram. Optional.
+
+RL ARTEFACTS
+  dqn_model.pth                 Trained Q-network weights.
+  rl_train_set.pkl              Training split with features and signal.
+  rl_test_set.pkl               Held-out test split.
+  rl_main_ticker.txt            Primary ticker chosen during training.
+  rl_training_metrics.json      Backtest results on the test split.
+
+EVALUATION OUTPUTS
+  ablation_results.csv
+  walkforward_results.csv
+  rl_comparison.csv
+  rl_equity_curves.png
+
+MODEL FILES
+  models/registry.json          Named-model index.
+  models/english_lora_<ts>/     One directory per training run.
+      merged/                   The final model and tokenizer.
+      metrics.json              Evaluation results and hyperparameters.
+      plots/                    Training curves.
+
+LOGS
+  logs/training_output.log      Summariser training stdout.
+  logs/rl_training_output.log   RL training stdout.
+  training_logs/<run_id>/       Per-run epoch metrics.
+  training_logs/<run_id>/final_summary.json
+  training_logs/<run_id>/full_log.json
+
+
+================================================================================
+12. ENVIRONMENT VARIABLES
+================================================================================
+
+  OLLAMA_URL       Default http://localhost:11434
+  OLLAMA_MODEL     Default llama3.2:1b
+  ENABLE_TELEGRAM  Default 0. Set to 1 to show the Telegram panel.
+  FINNHUB_KEY      Used by build_corpus.py and build_gold_set.py if you
+                   refactor the hard-coded key into an environment lookup.
+  ALPHA_VANTAGE_API_KEY  Optional. Only needed for the Alpha Vantage
+                         provider.
+  TWELVE_DATA_API_KEY    Optional. Only needed for the Twelve Data
+                         provider.
+
+
+================================================================================
+13. TROUBLESHOOTING
+================================================================================
+
+  "No trained summarisation model found"
+    Either no model is registered, or the registry's path points to a
+    directory that no longer exists. Open the Model Registry panel and
+    verify the path, or retrain.
+
+  "Ollama not running" in the sidebar
+    Start Ollama with "ollama serve" and refresh the page. The app falls
+    back to template explanations automatically, so nothing breaks.
+
+  Training appears stuck but the log file keeps growing
+    The flag file in logs/ is used to restore UI state after a refresh.
+    If the underlying process died, click "Force reset" to clear the flag.
+
+  "rl_test_set.pkl not found" during evaluation
+    The RL agent has not been trained yet, or its artefacts were deleted.
+    Retrain the RL agent from the sidebar.
+
+  Streamlit shows a stack trace for a subprocess
+    The evaluation scripts print to stderr on failure. The UI shows the
+    last three thousand characters of stderr. Run the script directly
+    from the terminal for the full traceback.
+
+  yfinance returns empty data for a ticker
+    Some tickers need a suffix. For example, London-listed stocks use
+    ".L", and crypto pairs use "-USD" (BTC-USD, not BTC).
+
+  The hf_telegram_corpus.csv contains Russian text
+    The upstream datasets are predominantly Russian. Either drop the
+    corpus, or add a langdetect filter in build_hf_corpus.py as described
+    in the project report.
+
+  The Finnhub API key is committed to the repository
+    Move it to an environment variable before publishing. The same
+    applies to the Telegram api_id and api_hash in scraper.py, and to
+    any *.session file.
+
+
+================================================================================
+14. KNOWN LIMITATIONS
+================================================================================
+
+  The RL agent does not outperform buy-and-hold or a random policy on
+  the current held-out test split. See Chapter 5 of the report for the
+  full discussion and for the three diagnoses (signal sparsity, short
+  test window, flat underlying stock).
+
+  The signal generator is rule-based and does not learn from data.
+  It recognises tickers and direction keywords but cannot infer an
+  action from a paraphrase that omits the keyword list.
+
+  The composite signal is conservative: when the rule-based extractor
+  and FinBERT disagree, the signal collapses to zero and the agent
+  receives no information.
+
+  The gold set is drawn from Finnhub headlines, which are formal and
+  written by journalists. The training corpus includes informal RSS and
+  Telegram text. Cross-source generalisation is not measured.
+
+  The DQN is trained on a single ticker. A portfolio-level policy would
+  require a multi-asset state and action space and is left as future
+  work.
+
+  Bootstrap confidence intervals are computed for ROUGE only. The RL
+  comparison table does not yet include paired tests against the
+  baselines.
+
+================================================================================
+END OF INSTRUCTIONS
+================================================================================

@@ -1,0 +1,5237 @@
+================================================================================
+FILE: ./ablation.py
+================================================================================
+
+"""
+Ablation study: measures the contribution of each pipeline component.
+
+Configurations:
+    A. Baseline        — no analyst signal, no RL, no LLM. Just summariser output.
+    B. + Analyst       — add rule-based signal extractor, still no RL.
+    C. + FinBERT       — composite signal, still no RL.
+    D. + RL (full)     — composite signal + DQN trading policy.
+
+For each, computes:
+    - ROUGE-1 / ROUGE-L of the summariser on the gold set (same across all)
+    - Backtest metrics on the held-out test split
+
+Outputs ablation_results.csv.
+"""
+import os
+
+import numpy as np
+import pandas as pd
+
+from RL.backtest import run_backtest
+from RL.rl_agent import DQNAgent
+from advisor import get_advice
+
+TEST_PKL = "rl_test_set.pkl"
+MODEL_PATH = "dqn_model.pth"
+TICKER_FILE = "rl_main_ticker.txt"
+SPLIT_FRAC = 0.8
+
+
+def _load_or_rebuild_test_set():
+    """
+    Load the saved test split if it exists; otherwise rebuild it from the
+    ticker file using yfinance. If neither exists, default to AAPL so the
+    ablation can still run for demonstration purposes.
+    """
+    if os.path.exists(TEST_PKL):
+        df = pd.read_pickle(TEST_PKL)
+        print(f"Loaded {TEST_PKL}: {len(df)} bars")
+        return df
+
+    if os.path.exists(TICKER_FILE):
+        with open(TICKER_FILE) as f:
+            ticker = f.read().strip()
+    else:
+        ticker = "AAPL"
+        print(f"Neither {TEST_PKL} nor {TICKER_FILE} exists — defaulting to {ticker}")
+
+    print(f"{TEST_PKL} not found — rebuilding from yfinance for {ticker}")
+
+    from market_data import get_market_data, compute_features
+    from datetime import datetime, timedelta
+
+    end = datetime.now().strftime('%Y-%m-%d')
+    start = (datetime.now() - timedelta(days=365 * 2)).strftime('%Y-%m-%d')
+    df = get_market_data(ticker, start, end)
+    df_feat = compute_features(df)
+    df_feat['signal'] = 0
+
+    split = int(len(df_feat) * SPLIT_FRAC)
+    test = df_feat.iloc[split:].copy()
+    test.to_pickle(TEST_PKL)
+    print(f"Rebuilt and saved {TEST_PKL}: {len(test)} bars")
+    return test
+
+
+def _load_agent(state_dim=7):
+    if not os.path.exists(MODEL_PATH):
+        return None
+    agent = DQNAgent(state_dim=state_dim, action_dim=3)
+    agent.load(MODEL_PATH)
+    return agent
+
+
+def _rule_based_backtest(test_df, signal_col):
+    """Roll through the test set applying the rule-based advisor."""
+    cash = 10000.0
+    position = 0
+    values = []
+    for _, row in test_df.iterrows():
+        sig = int(row[signal_col])
+        act_word = {0: "hold", 1: "buy", 2: "sell"}.get(sig, "hold")
+        final_action, _ = get_advice(act_word, "X", float(row['rsi']), float(row['Close']))
+        price = float(row['Close'])
+        if final_action == "BUY" and position == 0:
+            sz = int(cash * 0.95 / price)
+            cash -= sz * price
+            position = sz
+        elif final_action == "SELL" and position > 0:
+            cash += position * price
+            position = 0
+        values.append(cash + position * price)
+
+    values = np.array(values)
+    if len(values) < 2:
+        return {"return_pct": 0.0, "sharpe": 0.0, "max_dd": 0.0}
+
+    returns = np.diff(values) / values[:-1]
+    ann = 252
+    n = len(values)
+    total_ret = (values[-1] / values[0] - 1) * 100
+    ann_ret = ((values[-1] / values[0]) ** (ann / n) - 1) * 100
+    ann_vol = np.std(returns, ddof=1) * np.sqrt(ann) * 100
+    sharpe = ann_ret / ann_vol if ann_vol > 0 else 0.0
+    running_max = np.maximum.accumulate(values)
+    max_dd = ((values - running_max) / running_max).min() * 100
+    return {"return_pct": round(total_ret, 2),
+            "sharpe": round(sharpe, 3),
+            "max_dd": round(max_dd, 2)}
+
+
+def main():
+    test_df = _load_or_rebuild_test_set()
+
+    results = []
+
+    # A. No signal (all zeros)
+    test_a = test_df.copy()
+    test_a['signal'] = 0
+    r_a = _rule_based_backtest(test_a, 'signal')
+    r_a["config"] = "A. Summariser only (no signal, no RL)"
+    results.append(r_a)
+
+    # B. Composite signal, rule-based advisor
+    r_b = _rule_based_backtest(test_df, 'signal')
+    r_b["config"] = "B. Rule-based advisor"
+    results.append(r_b)
+
+    # C. Composite signal, no RSI filter (raw signal follow)
+    test_c = test_df.copy()
+    r_c = _rule_based_backtest(test_c, 'signal')
+    r_c["config"] = "C. Composite signal (analyst + FinBERT)"
+    results.append(r_c)
+
+    # D. Full pipeline with RL
+    agent = _load_agent()
+    if agent is not None:
+        r_d = run_backtest(agent, test_df, test_df['signal'], initial_cash=10000)
+        r_d = {
+            "return_pct": round(r_d["total_return"], 2),
+            "sharpe": round(r_d["sharpe_ratio"] or 0.0, 3),
+            "max_dd": round(r_d["max_drawdown"], 2),
+            "config": "D. Full pipeline (+ RL)",
+        }
+        results.append(r_d)
+    else:
+        print(f"{MODEL_PATH} missing — skipping config D")
+
+    df = pd.DataFrame(results)[["config", "return_pct", "sharpe", "max_dd"]]
+    df.to_csv("ablation_results.csv", index=False)
+
+    print("================= Ablation =================")
+    print(df.to_string(index=False))
+    print("Saved ablation_results.csv")
+
+
+if __name__ == "__main__":
+    main()
+-e 
+
+================================================================================
+FILE: ./advisor.py
+================================================================================
+
+def get_advice(summary_action, ticker, rsi, price):
+    """
+    Returns (action, explanation) based on summary_action and RSI.
+    """
+    if summary_action == 'buy':
+        if rsi < 70:
+            action = 'BUY'
+            reason = f"bullish signal and RSI ({rsi:.1f}) is not overbought"
+        else:
+            action = 'HOLD'
+            reason = f"bullish signal but RSI ({rsi:.1f}) suggests overbought conditions"
+    elif summary_action == 'sell':
+        if rsi > 30:
+            action = 'SELL'
+            reason = f"bearish signal and RSI ({rsi:.1f}) is not oversold"
+        else:
+            action = 'HOLD'
+            reason = f"bearish signal but RSI ({rsi:.1f}) suggests oversold conditions"
+    else:
+        action = 'HOLD'
+        reason = "no clear signal from the analyst"
+
+    explanation = f"We recommend {action} for {ticker} because {reason}. Current price: {price:.2f}"
+    return action, explanation
+-e 
+
+================================================================================
+FILE: ./app.py
+================================================================================
+
+"""Financial Advisor Bot — Streamlit front-end.
+
+Wires the trained summariser, signal extractor, RL agent, and explanation
+layer into a single web UI. Long-running work (training, scraping,
+evaluation) runs in a subprocess or a background thread so the Streamlit
+event loop stays responsive.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import shutil
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+import traceback
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+import torch
+
+import model_registry
+from market_data_providers import get_market_data_with_provider
+from summarizer import summarize_post, extract_signal, set_model_path
+from train_model import train_english_lora
+from training_logger import TrainingLogger
+from utils.utils import get_named_models
+
+
+# ======================================================================
+# Constants
+# ======================================================================
+
+CHANNELS = [
+    "Bloomberg",
+    "TraderTVLive",
+    "TheFinancialExpressOnline",
+    "vanillafinancenews",
+    "TradingGainX",
+]
+
+FLAG_STALE_SECONDS = 3 * 60 * 60  # 3 hours
+FLAG_DIR = "logs"
+
+RL_AGENT_PATH = "dqn_model.pth"
+RL_LOG_PATH = "logs/rl_training_output.log"
+DEFAULT_TRAINING_LOG = "logs/training_output.log"
+DEFAULT_CORPUS = "training_corpus_large.csv"
+DEFAULT_GOLD_SET = "gold_set_v2.csv"
+
+GOLD_SET_CANDIDATES = ("gold_set_v2.csv", "filtered_telegram_gold.csv")
+
+CORPUS_SOURCES = {
+    "Training corpus (merged)": {
+        "path": "training_corpus_large.csv",
+        "text_col": "cleaned_text",
+        "summary_col": "summary",
+    },
+    "HF Telegram corpus (mxlcw)": {
+        "path": "hf_telegram_corpus.csv",
+        "text_col": "cleaned_text",
+        "summary_col": "summary",
+    },
+    "Finnhub news corpus": {
+        "path": "eulerpool_corpus.csv",
+        "text_col": "content",
+        "summary_col": "headline",
+    },
+    "RSS news corpus": {
+        "path": "rss_corpus.csv",
+        "text_col": "content",
+        "summary_col": "headline",
+    },
+    "Gold set v2 (Finnhub, held out)": {
+        "path": "gold_set_v2.csv",
+        "text_col": "cleaned_text",
+        "summary_col": "summary",
+    },
+    "Legacy gold set": {
+        "path": "filtered_telegram_gold.csv",
+        "text_col": "cleaned_text",
+        "summary_col": "summary",
+    },
+    "Telegram DB (legacy)": None,
+}
+
+SESSION_DEFAULTS = {
+    "scraping": False,
+    "selected_model": None,
+    "selected_model_name": None,
+    "current_post": None,
+    "rl_training": False,
+    "rl_training_log_file": RL_LOG_PATH,
+    "_loaded_model_path": None,
+}
+
+
+@dataclass
+class AppConfig:
+    """Configuration produced by the sidebar and consumed by the main body."""
+    data_provider: str
+    recommendation_mode: str
+    confidence_threshold: float
+    use_llm: bool
+    llm_model: Optional[str]
+    rl_available: bool
+
+
+# ======================================================================
+# Training-flag helpers (survive page refreshes)
+# ======================================================================
+
+def _flag_path(log_file: str) -> str:
+    return log_file + ".flag"
+
+
+def _write_flag(log_file: str, kind: str) -> None:
+    """Write a marker file saying a training job is in progress."""
+    try:
+        os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
+        with open(_flag_path(log_file), "w") as f:
+            json.dump({"kind": kind, "started": datetime.now().isoformat()}, f)
+    except Exception:
+        pass
+
+
+def _remove_flag(log_file: str) -> None:
+    try:
+        path = _flag_path(log_file)
+        if os.path.exists(path):
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def _find_active_flags() -> list[tuple[str, dict]]:
+    """Return [(log_file, flag_data), ...] for every live training marker."""
+    out: list[tuple[str, dict]] = []
+    if not os.path.exists(FLAG_DIR):
+        return out
+
+    for fname in os.listdir(FLAG_DIR):
+        if not fname.endswith(".flag"):
+            continue
+        flag_path = os.path.join(FLAG_DIR, fname)
+        try:
+            age = time.time() - os.path.getmtime(flag_path)
+        except OSError:
+            continue
+        if age > FLAG_STALE_SECONDS:
+            try:
+                os.remove(flag_path)
+            except OSError:
+                pass
+            continue
+
+        log_file = flag_path[: -len(".flag")]
+        try:
+            with open(flag_path) as f:
+                data = json.load(f)
+        except Exception:
+            data = {"kind": "summariser"}
+        out.append((log_file, data))
+    return out
+
+
+def _reconstruct_training_state() -> None:
+    """Rebuild st.session_state from flags on disk after a page refresh."""
+    for log_file, data in _find_active_flags():
+        kind = data.get("kind", "summariser")
+        if kind == "rl":
+            if not st.session_state.get("rl_training", False):
+                st.session_state.rl_training = True
+                st.session_state.rl_training_log_file = log_file
+        else:
+            if not st.session_state.get("training", False):
+                st.session_state.training = True
+                st.session_state.training_log_file = log_file
+
+
+# ======================================================================
+# Corpus helpers
+# ======================================================================
+
+def get_random_corpus_row(source_name: str) -> Optional[dict]:
+    """Pull one random example from the named corpus source."""
+    spec = CORPUS_SOURCES.get(source_name)
+
+    # Legacy Telegram DB path (source name maps to None).
+    if spec is None:
+        try:
+            conn = sqlite3.connect("telegram_legacy/telegram_posts.db")
+            cur = conn.cursor()
+            placeholders = ",".join(["?"] * len(CHANNELS))
+            cur.execute(
+                f"SELECT channel, date, text, NULL FROM posts "
+                f"WHERE channel IN ({placeholders}) "
+                f"ORDER BY RANDOM() LIMIT 1",
+                tuple(CHANNELS),
+            )
+            row = cur.fetchone()
+            conn.close()
+        except Exception:
+            return None
+        if not row:
+            return None
+        return {"channel": row[0], "date": row[1], "text": row[2], "reference": None}
+
+    path = spec["path"]
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path, sep=";")
+    except Exception:
+        return None
+    if df.empty:
+        return None
+
+    tcol, scol = spec["text_col"], spec["summary_col"]
+    if tcol not in df.columns or scol not in df.columns:
+        return None
+
+    row = df.sample(1).iloc[0]
+    return {
+        "channel": spec["path"],
+        "date": "",
+        "text": str(row[tcol]),
+        "reference": str(row[scol]),
+    }
+
+
+def corpus_stats(path: str) -> Optional[dict]:
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path, sep=";")
+    except Exception:
+        return None
+    if df.empty:
+        return None
+    return {
+        "rows": len(df),
+        "cols": list(df.columns),
+        "avg_text": int(df.iloc[:, 0].astype(str).str.len().mean()),
+    }
+
+
+def clean_corpus_file(path: str) -> tuple[int, int]:
+    """In-place corpus cleaning. Returns (rows_before, rows_after)."""
+    df = pd.read_csv(path, sep=";")
+    n0 = len(df)
+
+    url_only = df["cleaned_text"].str.match(r"^\s*https?://\S+\s*$", na=False)
+    df = df[~url_only]
+
+    def is_english_ish(s):
+        if not isinstance(s, str) or not s:
+            return False
+        ascii_letters = sum(1 for c in s if c.isascii() and c.isalpha())
+        total_letters = sum(1 for c in s if c.isalpha())
+        if total_letters == 0:
+            return False
+        return (ascii_letters / total_letters) > 0.60
+
+    mask = df["cleaned_text"].apply(is_english_ish) & df["summary"].apply(is_english_ish)
+    df = df[mask]
+
+    bad_summary = df["summary"].str.contains(r"https?://|@\w+", regex=True, na=False)
+    df = df[~bad_summary]
+
+    df = df[
+        (df["cleaned_text"].str.len().between(100, 2000))
+        & (df["summary"].str.len().between(20, 400))
+    ]
+    df = df.drop_duplicates(subset=["cleaned_text"])
+
+    df.to_csv(path, sep=";", index=False)
+    return n0, len(df)
+
+
+# ======================================================================
+# Subprocess helper
+# ======================================================================
+
+def _run_python_script(script: str, timeout: int = 3600) -> tuple[bool, str]:
+    """Run a script as a subprocess. Returns (ok, error_message).
+
+    stdout is discarded — the scripts write their results to CSV files
+    which the UI reads directly. stderr is returned on failure.
+    """
+    if not os.path.exists(script):
+        return False, f"Script not found: {script}"
+
+    # Prefer the real `python3` on PATH; sys.executable can be a shim on macOS.
+    python_exe = shutil.which("python3") or sys.executable
+
+    try:
+        r = subprocess.run(
+            [python_exe, script],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+            timeout=timeout,
+            cwd=os.getcwd(),
+            text=True,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"Timed out after {timeout}s"
+    except Exception as e:
+        return False, f"{type(e).__name__}: {e}"
+
+    if r.returncode == 0:
+        return True, ""
+
+    err = (r.stderr or "").strip() or f"Script exited with code {r.returncode} (no stderr)"
+    return False, err[-3000:]
+
+
+# ======================================================================
+# Background worker threads
+# ======================================================================
+
+def run_training_thread(csv_path, log_file_path, hyperparams, model_name, notes):
+    """Train a LoRA summariser in a thread; redirect stdout/stderr to a log."""
+    orig_out, orig_err = sys.stdout, sys.stderr
+    _write_flag(log_file_path, "summariser")
+    try:
+        os.makedirs(os.path.dirname(log_file_path) or ".", exist_ok=True)
+        with open(log_file_path, "w") as f:
+            sys.stdout = f
+            sys.stderr = f
+            try:
+                model_path = train_english_lora(
+                    csv_path, hyperparams, model_name=model_name, notes=notes,
+                )
+                st.session_state.training_result = {
+                    "status": "success",
+                    "model_path": model_path,
+                    "model_name": model_name,
+                }
+            except Exception as e:
+                print(f"ERROR: {e}")
+                traceback.print_exc()
+                st.session_state.training_result = {
+                    "status": "error",
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                }
+            finally:
+                sys.stdout, sys.stderr = orig_out, orig_err
+    except Exception as e:
+        st.session_state.training_result = {
+            "status": "error",
+            "error": f"Failed to start: {e}",
+        }
+    finally:
+        _remove_flag(log_file_path)
+    st.session_state.training = False
+    st.rerun()
+
+
+def run_scraper_thread():
+    """Scrape Telegram channels in a thread. Import is lazy so app boots without scraper.py."""
+    try:
+        from telegram_legacy.scraper import scrape_all_channels
+        st.session_state.scrape_results = asyncio.run(scrape_all_channels())
+    except Exception as e:
+        st.session_state.scrape_results = {"error": str(e)}
+    st.session_state.scraping = False
+    st.rerun()
+
+
+def run_rl_training_thread(log_file_path, model_path):
+    """Train the RL agent in a thread; redirect stdout/stderr to a log."""
+    set_model_path(model_path)
+    orig_out, orig_err = sys.stdout, sys.stderr
+    _write_flag(log_file_path, "rl")
+    try:
+        os.makedirs(os.path.dirname(log_file_path) or ".", exist_ok=True)
+        with open(log_file_path, "w") as f:
+            sys.stdout = f
+            sys.stderr = f
+            try:
+                from train_rl_agent import train_rl
+                train_rl()
+                st.session_state.rl_training_result = {
+                    "status": "success",
+                    "message": "RL agent trained successfully!",
+                }
+            except Exception as e:
+                print(f"ERROR in RL training: {e}")
+                traceback.print_exc()
+                st.session_state.rl_training_result = {
+                    "status": "error",
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                }
+            finally:
+                sys.stdout, sys.stderr = orig_out, orig_err
+    except Exception as e:
+        st.session_state.rl_training_result = {
+            "status": "error",
+            "error": f"Failed to start RL training: {e}",
+        }
+    finally:
+        _remove_flag(log_file_path)
+    st.session_state.rl_training = False
+    st.rerun()
+
+
+# ======================================================================
+# Gold-set evaluation + bootstrap
+# ======================================================================
+
+def _evaluate_predictions(preds: list[str], refs: list[str]) -> dict:
+    import evaluate
+    rouge = evaluate.load("rouge")
+    scores = rouge.compute(predictions=preds, references=refs, use_stemmer=True)
+    return {k: v * 100 for k, v in scores.items()}
+
+
+def evaluate_on_gold(model_path: str, gold_path: str, max_examples: Optional[int] = None):
+    """Run the summariser on the gold set and return (scores, rows, preds, refs)."""
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
+    gold = pd.read_csv(gold_path, sep=";")
+    gold.columns = gold.columns.str.strip()
+
+    if "cleaned_text" not in gold.columns:
+        for cand in ("content", "text", "body"):
+            if cand in gold.columns:
+                gold = gold.rename(columns={cand: "cleaned_text"})
+                break
+    if "summary" not in gold.columns:
+        for cand in ("headline", "title", "highlights"):
+            if cand in gold.columns:
+                gold = gold.rename(columns={cand: "summary"})
+                break
+    if "cleaned_text" not in gold.columns or "summary" not in gold.columns:
+        raise ValueError(f"Gold CSV must have text/summary columns: {list(gold.columns)}")
+
+    if max_examples is not None:
+        gold = gold.head(max_examples)
+
+    tok = AutoTokenizer.from_pretrained(model_path)
+    mdl = AutoModelForSeq2SeqLM.from_pretrained(model_path)
+    if torch.backends.mps.is_available():
+        mdl.to("mps")
+    mdl.eval()
+    device = next(mdl.parameters()).device
+
+    preds, refs, rows = [], [], []
+    for _, row in gold.iterrows():
+        inp = tok("summarize: " + str(row["cleaned_text"]),
+                  return_tensors="pt", truncation=True, max_length=384)
+        inp = {k: v.to(device) for k, v in inp.items()}
+        with torch.no_grad():
+            out = mdl.generate(
+                **inp, max_new_tokens=64, num_beams=5, early_stopping=True,
+                no_repeat_ngram_size=4, repetition_penalty=1.5,
+            )
+        pred = tok.decode(out[0], skip_special_tokens=True)
+        ref = str(row["summary"])
+        preds.append(pred)
+        refs.append(ref)
+        rows.append({
+            "reference": ref,
+            "prediction": pred,
+            "input": str(row["cleaned_text"])[:200] + "...",
+        })
+
+    scores = {k: round(v, 2) for k, v in _evaluate_predictions(preds, refs).items()}
+    return scores, rows, preds, refs
+
+
+def bootstrap_ci(preds, refs, n_boot: int = 200, alpha: float = 0.05, seed: int = 42) -> Optional[dict]:
+    rng = np.random.default_rng(seed)
+    n = len(preds)
+    if n < 5:
+        return None
+
+    boot = {"rouge1": [], "rouge2": [], "rougeL": []}
+    for _ in range(n_boot):
+        idx = rng.integers(0, n, n)
+        bp = [preds[i] for i in idx]
+        br = [refs[i] for i in idx]
+        try:
+            sc = _evaluate_predictions(bp, br)
+            for k in boot:
+                if k in sc:
+                    boot[k].append(sc[k])
+        except Exception:
+            continue
+
+    lo_q = 100 * alpha / 2
+    hi_q = 100 * (1 - alpha / 2)
+    return {
+        k: {
+            "mean": float(np.mean(v)),
+            "lo": float(np.percentile(v, lo_q)),
+            "hi": float(np.percentile(v, hi_q)),
+            "n": len(v),
+        }
+        for k, v in boot.items()
+        if v
+    }
+
+
+# ======================================================================
+# RL helpers
+# ======================================================================
+
+_rl_agent = None
+_rl_agent_loaded = False
+
+
+def get_rl_agent():
+    global _rl_agent, _rl_agent_loaded
+    if not _rl_agent_loaded:
+        if os.path.exists(RL_AGENT_PATH):
+            try:
+                from RL.rl_agent import DQNAgent
+                agent = DQNAgent(state_dim=7, action_dim=3)
+                agent.load(RL_AGENT_PATH)
+                _rl_agent = agent
+            except Exception as e:
+                st.error(f"Failed to load RL agent: {e}")
+                _rl_agent = None
+        else:
+            _rl_agent = None
+        _rl_agent_loaded = True
+    return _rl_agent
+
+
+def get_rl_recommendation(df_feat, signal_action: str, confidence_threshold: float = 0.05):
+    """Ask the RL agent for an action.
+
+    Returns (final_action | None, q_str, confident: bool).
+    """
+    agent = get_rl_agent()
+    if agent is None:
+        return None, "RL agent not available.", True
+
+    try:
+        from RL.rl_env import TradingEnv
+
+        action_val = {"buy": 1, "sell": 2}.get(signal_action, 0)
+        signal_series = pd.Series([0] * len(df_feat))
+        signal_series.iloc[-1] = action_val
+
+        env = TradingEnv(df_feat, signal_series)
+        state, _ = env.reset()
+        for _ in range(len(df_feat) - 1):
+            env.step(0)
+
+        rl_action = agent.act(state, training=False)
+        final_action = {0: "HOLD", 1: "BUY", 2: "SELL"}.get(rl_action, "HOLD")
+
+        state_tensor = torch.FloatTensor(state).unsqueeze(0).to(agent.device)
+        q_values = agent.q_net(state_tensor)
+        q = q_values[0].detach().cpu().numpy()
+
+        q_str = f"Hold: {q[0]:.2f}, Buy: {q[1]:.2f}, Sell: {q[2]:.2f}"
+        sorted_q = np.sort(q)[::-1]
+        margin = float(sorted_q[0] - sorted_q[1])
+
+        if margin < confidence_threshold:
+            return None, f"{q_str} (margin {margin:.3f} below threshold)", False
+        return final_action, q_str, True
+    except Exception as e:
+        return None, str(e), False
+
+
+# ======================================================================
+# Sidebar — split into focused sub-renderers
+# ======================================================================
+
+def render_sidebar() -> AppConfig:
+    with st.sidebar:
+        st.subheader("Configuration")
+        st.caption("Market data provider: **Yahoo Finance** (no API key required).")
+        data_provider = "yfinance"
+
+        rl_available = os.path.exists(RL_AGENT_PATH)
+        recommendation_mode, confidence_threshold = _render_recommendation_controls(rl_available)
+
+        st.subheader("Explanation Generator")
+        use_llm, llm_model = _render_llm_controls()
+
+        st.subheader("RL Agent Training")
+        _render_rl_training_controls(rl_available)
+
+        st.divider()
+        _render_corpus_inventory()
+
+    return AppConfig(
+        data_provider=data_provider,
+        recommendation_mode=recommendation_mode,
+        confidence_threshold=confidence_threshold,
+        use_llm=use_llm,
+        llm_model=llm_model,
+        rl_available=rl_available,
+    )
+
+
+def _render_recommendation_controls(rl_available: bool) -> tuple[str, float]:
+    if not rl_available:
+        st.info("RL agent not trained. Using Rule-Based mode.")
+        return "Rule-Based (Explainable)", 0.05
+
+    mode = st.radio(
+        "Recommendation Engine",
+        ["Rule-Based (Explainable)", "Reinforcement Learning (RL)"],
+        index=1,
+    )
+    threshold = st.slider(
+        "RL confidence threshold", 0.0, 0.5, 0.05, 0.01,
+        help="Fall back to rule-based if top two Q-values are closer than this.",
+    )
+    return mode, threshold
+
+
+def _render_llm_controls() -> tuple[bool, Optional[str]]:
+    try:
+        from llm_advisor import is_available as llm_available, list_models as llm_list_models
+        llm_ok = llm_available()
+    except Exception:
+        llm_ok = False
+        llm_list_models = lambda: []
+
+    if not llm_ok:
+        st.caption("Ollama not running — using template explanations.")
+        return False, None
+
+    st.success("Ollama detected")
+    models = llm_list_models()
+    if models:
+        llm_model = st.selectbox("LLM model", models, index=0)
+    else:
+        llm_model = os.environ.get("OLLAMA_MODEL", "llama3.2:1b")
+    use_llm = st.checkbox("Use LLM for explanations", value=True)
+    return use_llm, llm_model
+
+
+def _render_rl_training_controls(rl_available: bool) -> None:
+    if rl_available:
+        _render_rl_ready_panel()
+    else:
+        _render_rl_train_panel()
+
+    if st.session_state.get("rl_training", False):
+        _render_rl_training_progress()
+
+    result = st.session_state.get("rl_training_result")
+    if not result:
+        return
+
+    if result["status"] == "success":
+        st.success(result["message"])
+        _reset_rl_agent_cache()
+        st.rerun()
+    else:
+        st.error(f"RL training failed: {result['error']}")
+        if "traceback" in result:
+            with st.expander("Show error details"):
+                st.code(result["traceback"])
+
+
+def _render_rl_ready_panel() -> None:
+    st.success("RL agent is ready!")
+    if st.button("Delete RL agent"):
+        try:
+            for f in (RL_AGENT_PATH, "rl_training_metrics.json",
+                      "rl_test_set.pkl", "rl_train_set.pkl", "rl_main_ticker.txt"):
+                if os.path.exists(f):
+                    os.remove(f)
+            _reset_rl_agent_cache()
+            st.success("RL agent deleted.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Failed to delete: {e}")
+
+
+def _render_rl_train_panel() -> None:
+    st.warning("RL agent not found.")
+    if not st.button("Train RL Agent (background)"):
+        return
+    if st.session_state.get("rl_training", False):
+        return
+
+    sel_model_path = st.session_state.get("selected_model")
+    if sel_model_path is None:
+        st.warning("Please select a summarisation model first.")
+        return
+
+    st.session_state.rl_training = True
+    st.session_state.rl_training_result = None
+    threading.Thread(
+        target=run_rl_training_thread,
+        args=(RL_LOG_PATH, sel_model_path),
+    ).start()
+
+
+def _render_rl_training_progress() -> None:
+    st.info("RL training in progress...")
+    rl_log = st.session_state.get("rl_training_log_file", RL_LOG_PATH)
+
+    if os.path.exists(rl_log):
+        with open(rl_log) as f:
+            content = f.read()
+        mtime = datetime.fromtimestamp(os.path.getmtime(rl_log)).strftime("%H:%M:%S")
+        st.caption(f"Last updated: {mtime}")
+        st.text_area("RL Training Logs", value=content, height=200)
+    else:
+        st.text("Waiting for logs...")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Refresh RL Logs", key="refresh_rl_logs"):
+            st.rerun()
+    with c2:
+        if st.button("Force reset", key="force_reset_rl"):
+            _remove_flag(rl_log)
+            st.session_state.rl_training = False
+            st.rerun()
+
+
+def _render_corpus_inventory() -> None:
+    st.subheader("Corpus Inventory")
+    for label, spec in CORPUS_SOURCES.items():
+        if spec is None:
+            continue
+        stats = corpus_stats(spec["path"])
+        if stats:
+            st.caption(f"**{label}** — {stats['rows']} rows")
+        else:
+            st.caption(f"**{label}** — missing")
+
+
+def _reset_rl_agent_cache() -> None:
+    global _rl_agent, _rl_agent_loaded
+    _rl_agent = None
+    _rl_agent_loaded = False
+
+
+# ======================================================================
+# Model registry
+# ======================================================================
+
+def render_model_registry() -> None:
+    with st.expander("Model Registry", expanded=False):
+        st.caption(
+            "Named models with their hyperparameters and validation metrics. "
+            "Names are created when you start training (see 'Train New Model' below)."
+        )
+
+        rows = model_registry.summary_rows()
+        if not rows:
+            st.info("No models registered yet. Train one below with a name to get started.")
+            return
+
+        st.dataframe(pd.DataFrame(rows), use_container_width=True)
+        _render_registry_management(rows)
+
+
+def _render_registry_management(rows: list[dict]) -> None:
+    st.markdown("**Manage a model**")
+    names = [r["Name"] for r in rows]
+    sel = st.selectbox("Select model", names, key="registry_manage_sel")
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        new_name = st.text_input("Rename to", value="", key="registry_rename_input")
+        if st.button("Rename", key="registry_rename_btn") and new_name:
+            if model_registry.rename(sel, new_name):
+                st.success(f"Renamed '{sel}' → '{new_name}'")
+                st.rerun()
+            else:
+                st.error("Rename failed (name in use or invalid).")
+    with c2:
+        if st.button("Delete entry (keep files)", key="registry_del_btn"):
+            if model_registry.remove(sel, delete_files=False):
+                st.success(f"Removed '{sel}' from registry.")
+                st.rerun()
+    with c3:
+        if st.button("Delete entry AND files", key="registry_del_files_btn"):
+            if model_registry.remove(sel, delete_files=True):
+                st.success(f"Removed '{sel}' and deleted its run directory.")
+                st.rerun()
+
+    entry = model_registry.get(sel)
+    if entry:
+        st.markdown(f"**Details for `{sel}`**")
+        st.json({
+            "path": entry.get("path"),
+            "created": entry.get("created"),
+            "hyperparams": entry.get("hyperparams"),
+            "metrics": entry.get("metrics"),
+            "notes": entry.get("notes"),
+        })
+
+
+# ======================================================================
+# Step 1 — model selection
+# ======================================================================
+
+def render_model_selection() -> None:
+    named_models = get_named_models()
+
+    st.subheader("Step 1: Choose a primary summarisation model")
+    if not named_models:
+        st.warning("No models found. Train one below.")
+        return
+
+    cols = st.columns(min(3, len(named_models)))
+    for idx, m in enumerate(named_models):
+        label = m["name"] if m["registered"] else f"{m['name']} (unregistered)"
+        with cols[idx % 3]:
+            if st.button(label, key=f"model_{idx}"):
+                st.session_state.selected_model = m["path"]
+                st.session_state.selected_model_name = m["name"]
+                st.rerun()
+
+    if not st.session_state.get("selected_model"):
+        st.info("Please select a model to proceed.")
+        return
+
+    sel_path = st.session_state.selected_model
+    sel_name = st.session_state.get("selected_model_name", "")
+    st.success(f"Selected: **{sel_name}**")
+
+    entry = model_registry.get(sel_name) if sel_name else None
+    if entry:
+        _render_selected_model_metrics(entry)
+
+    if st.session_state.get("_loaded_model_path") != sel_path:
+        set_model_path(sel_path)
+        st.session_state["_loaded_model_path"] = sel_path
+
+
+def _render_selected_model_metrics(entry: dict) -> None:
+    hp = entry.get("hyperparams", {})
+    mm = entry.get("metrics", {})
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("r", hp.get("r", "-"))
+    c2.metric("dropout", hp.get("dropout", "-"))
+    c3.metric("epochs", hp.get("num_epochs", "-"))
+    c4.metric("val ROUGE-L", mm.get("rougeL", "-"))
+    if entry.get("notes"):
+        st.caption(f"Notes: {entry['notes']}")
+
+
+# ======================================================================
+# Step 1b — gold-set evaluation
+# ======================================================================
+
+def render_gold_evaluation() -> None:
+    st.subheader("Step 1b: Evaluate selected model on a gold set")
+
+    gold_path = _pick_gold_set_path()
+    col_a, col_b = st.columns(2)
+    with col_a:
+        run_point = st.button("Run point-estimate ROUGE")
+    with col_b:
+        run_boot = st.button("Run with bootstrap 95% CIs (slower)")
+
+    if run_point or run_boot:
+        _run_gold_evaluation(gold_path)
+    if run_boot and st.session_state.get("gold_preds"):
+        _run_bootstrap()
+
+    if st.session_state.get("gold_scores"):
+        _render_gold_results()
+
+
+def _pick_gold_set_path() -> str:
+    options = [p for p in GOLD_SET_CANDIDATES if os.path.exists(p)]
+    if not options:
+        st.warning("No gold set found. Run `python build_gold_set.py` first.")
+        return st.text_input("Or paste a path:", DEFAULT_GOLD_SET)
+    return st.selectbox("Gold CSV", options, index=0)
+
+
+def _run_gold_evaluation(gold_path: str) -> None:
+    if not st.session_state.get("selected_model"):
+        st.error("Select a summarisation model in Step 1 first.")
+        return
+    if not os.path.exists(gold_path):
+        st.error(f"{gold_path} not found.")
+        return
+
+    with st.spinner("Evaluating on gold set..."):
+        try:
+            scores, rows, preds, refs = evaluate_on_gold(
+                st.session_state.selected_model, gold_path,
+            )
+            st.session_state.update({
+                "gold_scores": scores,
+                "gold_rows": rows,
+                "gold_path": gold_path,
+                "gold_preds": preds,
+                "gold_refs": refs,
+            })
+            sel_name = st.session_state.get("selected_model_name")
+            if sel_name:
+                model_registry.update_metrics(sel_name, {
+                    "rouge1": scores.get("rouge1"),
+                    "rouge2": scores.get("rouge2"),
+                    "rougeL": scores.get("rougeL"),
+                    "gold_eval_path": gold_path,
+                })
+        except Exception as e:
+            st.error(f"Evaluation failed: {e}")
+
+
+def _run_bootstrap() -> None:
+    with st.spinner("Bootstrapping 95% confidence intervals..."):
+        try:
+            st.session_state["gold_ci"] = bootstrap_ci(
+                st.session_state["gold_preds"],
+                st.session_state["gold_refs"],
+                n_boot=200,
+            )
+        except Exception as e:
+            st.error(f"Bootstrap failed: {e}")
+
+
+def _render_gold_results() -> None:
+    st.caption(f"Evaluated on: `{st.session_state.get('gold_path', '?')}`")
+    scores = st.session_state["gold_scores"]
+    ci = st.session_state.get("gold_ci")
+
+    cols = st.columns(len(scores))
+    for i, (k, v) in enumerate(scores.items()):
+        if ci and k in ci:
+            c = ci[k]
+            cols[i].metric(k.upper(), f"{v:.2f}",
+                           delta=f"95% CI [{c['lo']:.1f}, {c['hi']:.1f}]")
+        else:
+            cols[i].metric(k.upper(), f"{v:.2f}")
+
+    with st.expander("Show individual predictions (sample)"):
+        df = pd.DataFrame(st.session_state["gold_rows"]).head(15)
+        for i, row in df.iterrows():
+            st.markdown(f"**Example {i + 1}**")
+            st.markdown(f"*Input:* {row['input']}")
+            st.markdown(f"*Reference:* {row['reference']}")
+            st.markdown(f"*Prediction:* {row['prediction']}")
+            st.divider()
+
+
+# ======================================================================
+# Evaluation Suite (ablation / walk-forward / RL comparison)
+# ======================================================================
+
+def render_evaluation_suite(rl_available: bool) -> None:
+    st.subheader("Evaluation Suite")
+    tab_abl, tab_wf, tab_rl = st.tabs(["Ablation", "Walk-forward", "RL comparison"])
+
+    with tab_abl:
+        _render_script_tab(
+            caption="Runs `ablation.py`. Fast (~10s).",
+            button_label="Run ablation",
+            button_key="run_abl",
+            script="ablation.py",
+            spinner_msg="Running ablation.py...",
+            timeout=600,
+            results_csv="ablation_results.csv",
+            state_prefix="abl",
+        )
+
+    with tab_wf:
+        _render_script_tab(
+            caption="Runs `walkforward.py`. Slow: ~10 min (retrains 4×).",
+            button_label="Run walk-forward",
+            button_key="run_wf",
+            script="walkforward.py",
+            spinner_msg="Running walkforward.py...",
+            timeout=3600,
+            results_csv="walkforward_results.csv",
+            state_prefix="wf",
+            summary_renderer=_render_walkforward_summary,
+        )
+
+    with tab_rl:
+        _render_rl_comparison_tab(rl_available)
+
+
+def _render_script_tab(caption, button_label, button_key, script, spinner_msg,
+                       timeout, results_csv, state_prefix, summary_renderer=None):
+    st.caption(caption)
+    if st.button(button_label, key=button_key):
+        with st.spinner(spinner_msg):
+            ok, err = _run_python_script(script, timeout=timeout)
+        st.session_state[f"{state_prefix}_ok"] = ok
+        st.session_state[f"{state_prefix}_err"] = err
+        st.rerun()
+
+    if f"{state_prefix}_ok" in st.session_state:
+        if st.session_state[f"{state_prefix}_ok"]:
+            st.success(f"{button_label} completed")
+        else:
+            st.error(f"{button_label} failed")
+            if st.session_state.get(f"{state_prefix}_err"):
+                st.code(st.session_state[f"{state_prefix}_err"])
+
+    if os.path.exists(results_csv):
+        st.markdown("**Latest results**")
+        df = pd.read_csv(results_csv)
+        st.dataframe(df, use_container_width=True)
+        if summary_renderer:
+            summary_renderer(df)
+
+
+def _render_walkforward_summary(df: pd.DataFrame) -> None:
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Mean return %", f"{df['return_pct'].mean():+.2f}",
+              delta=f"± {df['return_pct'].std():.2f}")
+    c2.metric("Mean Sharpe", f"{df['sharpe'].mean():+.3f}",
+              delta=f"± {df['sharpe'].std():.3f}")
+    c3.metric("Mean max DD %", f"{df['max_dd'].mean():.2f}",
+              delta=f"± {df['max_dd'].std():.2f}")
+
+
+def _render_rl_comparison_tab(rl_available: bool) -> None:
+    st.caption("Runs `evaluate_rl.py`.")
+    can_run = rl_available and os.path.exists("rl_test_set.pkl")
+    if not can_run:
+        st.warning("Train the RL agent first.")
+
+    if st.button("Run RL comparison", key="run_rl_eval", disabled=not can_run):
+        with st.spinner("Running evaluate_rl.py..."):
+            ok, err = _run_python_script("evaluate_rl.py", timeout=600)
+        st.session_state["rl_eval_ok"] = ok
+        st.session_state["rl_eval_err"] = err
+        st.rerun()
+
+    if "rl_eval_ok" in st.session_state:
+        if st.session_state["rl_eval_ok"]:
+            st.success("RL comparison completed")
+        else:
+            st.error("RL comparison failed")
+            if st.session_state.get("rl_eval_err"):
+                st.code(st.session_state["rl_eval_err"])
+
+    if os.path.exists("rl_comparison.csv"):
+        st.dataframe(pd.read_csv("rl_comparison.csv", index_col="Strategy"),
+                     use_container_width=True)
+    if os.path.exists("rl_equity_curves.png"):
+        # Bug fix: use_column_width is deprecated in recent Streamlit.
+        st.image("rl_equity_curves.png", use_container_width=True)
+
+
+# ======================================================================
+# Corpus maintenance
+# ======================================================================
+
+def render_corpus_maintenance() -> None:
+    with st.expander("Corpus Maintenance"):
+        corpus_path = st.text_input("Corpus path", DEFAULT_CORPUS, key="clean_path")
+
+        _render_clean_corpus_button(corpus_path)
+        _render_corpus_preview(corpus_path)
+
+        st.divider()
+        _render_subset_creator(corpus_path)
+
+
+def _render_clean_corpus_button(corpus_path: str) -> None:
+    if not st.button("Clean corpus (in place)"):
+        return
+    if not os.path.exists(corpus_path):
+        st.error(f"{corpus_path} not found.")
+        return
+
+    backup = corpus_path + ".backup"
+    if not os.path.exists(backup):
+        pd.read_csv(corpus_path, sep=";").to_csv(backup, sep=";", index=False)
+        st.info(f"Backup saved to {backup}")
+
+    with st.spinner("Cleaning..."):
+        n0, n1 = clean_corpus_file(corpus_path)
+    st.success(f"Dropped {n0 - n1} rows. Kept {n1} / {n0}.")
+
+
+def _render_corpus_preview(corpus_path: str) -> None:
+    if not os.path.exists(corpus_path):
+        return
+    try:
+        df = pd.read_csv(corpus_path, sep=";")
+        st.write(
+            f"Rows: **{len(df)}** | "
+            f"Avg text: **{df['cleaned_text'].str.len().mean():.0f}** | "
+            f"Avg summary: **{df['summary'].str.len().mean():.0f}**"
+        )
+    except Exception as e:
+        st.warning(f"Could not preview corpus: {e}")
+
+
+def _render_subset_creator(corpus_path: str) -> None:
+    sub_size = st.number_input("Subset size (rows)", 200, 5000, 2000, 200,
+                               key="sub_size")
+    if not st.button("Create subset → training_corpus_small.csv"):
+        return
+    if not os.path.exists(corpus_path):
+        st.error(f"{corpus_path} not found.")
+        return
+
+    df_full = pd.read_csv(corpus_path, sep=";")
+    n = min(sub_size, len(df_full))
+    df_small = df_full.sample(n=n, random_state=42).reset_index(drop=True)
+    df_small.to_csv("training_corpus_small.csv", sep=";", index=False)
+    st.success(f"Wrote {n} rows → training_corpus_small.csv")
+
+
+# ======================================================================
+# Train new model
+# ======================================================================
+
+def render_training_form() -> None:
+    with st.expander("Train New Model", expanded=False):
+        st.markdown(
+            "Train a LoRA-T5 summariser. A **name is required** so the model "
+            "can be found later in the Model Registry."
+        )
+
+        model_name = st.text_input(
+            "Model name (e.g. expanded_v1, lora_r16_3ep)", value="",
+            key="train_model_name",
+            help="Must be unique. Existing names are rejected.",
+        )
+
+        name_taken = bool(model_name) and model_registry.exists(model_name)
+        if name_taken:
+            st.error(f"Name '{model_name}' already exists. Pick another.")
+
+        notes = st.text_input("Notes (optional)", value="", key="train_notes")
+
+        st.divider()
+        csv_path = st.text_input("Path to training CSV", DEFAULT_CORPUS)
+        log_file = st.text_input("Log file path", DEFAULT_TRAINING_LOG)
+        hyperparams = _render_hyperparameter_inputs(model_name)
+
+        _render_training_trigger(model_name, name_taken, csv_path, log_file, hyperparams, notes)
+        _render_training_progress()
+        _render_training_result()
+
+
+def _render_hyperparameter_inputs(model_name: str) -> dict:
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        lora_r = st.number_input("r (rank)", 4, 64, 16, 4)
+        lora_alpha = st.number_input("alpha", 8, 128, 32, 8)
+    with col2:
+        lora_dropout = st.slider("dropout", 0.0, 0.5, 0.10, 0.05)
+        learning_rate = st.number_input("learning rate", 1e-5, 1e-3, 5e-4,
+                                        format="%.0e", step=1e-5)
+    with col3:
+        num_epochs = st.number_input("epochs", 1, 50, 3, 1)
+        batch_size = st.number_input("batch size", 1, 8, 2, 1)
+
+    hyperparams = {
+        "r": lora_r, "alpha": lora_alpha, "dropout": lora_dropout,
+        "learning_rate": learning_rate, "num_epochs": num_epochs,
+        "batch_size": batch_size,
+    }
+
+    st.caption(
+        f"Will register as **{model_name or '—'}** with "
+        f"r={lora_r}, alpha={lora_alpha}, dropout={lora_dropout}, "
+        f"epochs={num_epochs}, batch={batch_size}, lr={learning_rate:.0e}"
+    )
+    return hyperparams
+
+
+def _render_training_trigger(model_name, name_taken, csv_path, log_file, hyperparams, notes):
+    disabled = (not model_name) or name_taken or st.session_state.get("training", False)
+    if not st.button("Start Training", key="train_button", disabled=disabled):
+        return
+    if st.session_state.get("training", False):
+        st.warning("Training already in progress.")
+        return
+    if not os.path.exists(csv_path):
+        st.error("CSV file not found.")
+        return
+
+    os.makedirs(os.path.dirname(log_file) or ".", exist_ok=True)
+    st.session_state.training = True
+    st.session_state.training_result = None
+    st.session_state.training_log_file = log_file
+    threading.Thread(
+        target=run_training_thread,
+        args=(csv_path, log_file, hyperparams, model_name, notes),
+    ).start()
+
+
+def _render_training_progress() -> None:
+    if not st.session_state.get("training", False):
+        return
+
+    st.info("Training in progress...")
+    log_path = st.session_state.get("training_log_file", DEFAULT_TRAINING_LOG)
+
+    if os.path.exists(log_path):
+        with open(log_path) as f:
+            content = f.read()
+        mtime = datetime.fromtimestamp(os.path.getmtime(log_path)).strftime("%H:%M:%S")
+        st.caption(f"Last updated: {mtime}")
+        st.text_area("Training Logs", value=content, height=300)
+    else:
+        st.text("Waiting for logs...")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Refresh Logs", key="refresh_train_logs"):
+            st.rerun()
+    with c2:
+        if st.button("Force reset (unstick UI)", key="force_reset_train"):
+            _remove_flag(log_path)
+            st.session_state.training = False
+            st.rerun()
+
+
+def _render_training_result() -> None:
+    result = st.session_state.get("training_result")
+    if not result:
+        return
+    if result["status"] == "success":
+        st.success(
+            f"Training completed! Model: "
+            f"{result.get('model_name') or result['model_path']}"
+        )
+        st.rerun()
+    else:
+        st.error(f"Training failed: {result['error']}")
+
+
+# ======================================================================
+# Training history dashboard
+# ======================================================================
+
+def render_training_history() -> None:
+    with st.expander("Training History Dashboard"):
+        all_runs = TrainingLogger().get_all_runs()
+        if not all_runs:
+            st.info("No training runs found.")
+            return
+        runs_df = pd.DataFrame(all_runs)
+        display_cols = [
+            c for c in ["run_id", "hyperparameters", "duration_seconds",
+                        "total_epochs", "status"]
+            if c in runs_df.columns
+        ]
+        st.dataframe(runs_df[display_cols])
+
+
+# ======================================================================
+# Telegram scraper panel (optional)
+# ======================================================================
+
+def render_scraper() -> None:
+    with st.expander("Scrape Telegram posts (optional)"):
+        if st.button("Scrape New Posts"):
+            if not st.session_state.get("scraping", False):
+                st.session_state.scraping = True
+                threading.Thread(target=run_scraper_thread).start()
+
+        if st.session_state.get("scraping", False):
+            st.info("Scraping in progress...")
+
+        results = st.session_state.pop("scrape_results", None)
+        if results is None:
+            return
+
+        if "error" in results:
+            st.error(f"Scraping error: {results['error']}")
+        else:
+            for ch, data in results.items():
+                if data["error"]:
+                    st.error(f"{ch}: {data['error']}")
+                else:
+                    st.success(f"{ch}: {data['saved']} new posts")
+        st.session_state.scraping = False
+
+
+# ======================================================================
+# Step 2 — analyse a random sample
+# ======================================================================
+
+def render_analysis(config: AppConfig) -> None:
+    if not st.session_state.get("selected_model"):
+        st.info("Select a model in Step 1 to analyse posts.")
+        return
+
+    st.subheader("Step 2: Analyse a random corpus sample")
+    source_name = st.selectbox(
+        "Sample source", list(CORPUS_SOURCES.keys()), index=0, key="sample_source",
+    )
+
+    if st.button("Load Random Sample"):
+        row = get_random_corpus_row(source_name)
+        if row is None:
+            st.warning(f"No rows available from '{source_name}'.")
+            st.session_state.current_post = None
+        else:
+            st.session_state.current_post = row
+            st.rerun()
+
+    post = st.session_state.get("current_post")
+    if post:
+        _render_analysis_for_post(post, config)
+
+
+def _render_analysis_for_post(post: dict, config: AppConfig) -> None:
+    st.write(f"**Source:** {post.get('channel', '?')}")
+    st.write(f"**Original text:** {post['text']}")
+
+    with st.spinner("Summarising..."):
+        summary = summarize_post(post["text"])
+    st.subheader("Generated summary")
+    st.write(summary)
+
+    if post.get("reference"):
+        st.markdown(f"**Reference summary:** {post['reference']}")
+
+    ticker, action = extract_signal(summary)
+    st.write(f"**Ticker:** {ticker} | **Analyst action:** {action}")
+
+    if ticker is None:
+        st.warning("No ticker found in summary.")
+        return
+
+    _render_recommendation(ticker, action, summary, config)
+
+
+def _render_recommendation(ticker, action, summary, config: AppConfig) -> None:
+    df_feat = _fetch_features(ticker, config.data_provider)
+    if df_feat is None:
+        return
+
+    latest = df_feat.iloc[-1]
+    rsi = float(latest["rsi"])
+    price = float(latest["Close"])
+
+    final_action, q_str = _decide_action(config, df_feat, action, ticker, rsi, price)
+    explanation = _generate_explanation(
+        config, summary, ticker, action, rsi, price, final_action, q_str,
+    )
+
+    st.subheader("Advisor recommendation")
+    st.write(f"**Action:** {final_action}")
+    st.write(f"**Explanation:** {explanation}")
+
+
+def _fetch_features(ticker: str, provider: str) -> Optional[pd.DataFrame]:
+    with st.spinner(f"Fetching market data ({provider})..."):
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+        try:
+            df = get_market_data_with_provider(
+                ticker, start_date, end_date, provider=provider,
+            )
+        except Exception as e:
+            st.error(f"Data fetch error: {e}")
+            return None
+
+    if df is None or df.empty:
+        st.warning(f"No market data for {ticker}.")
+        return None
+
+    from market_data import compute_features
+    return compute_features(df)
+
+
+def _decide_action(config: AppConfig, df_feat, action, ticker, rsi, price) -> tuple[str, Optional[str]]:
+    """Return (final_action, q_str). Falls back to rule-based when RL is unconfident."""
+    from advisor import get_advice
+
+    if config.recommendation_mode == "Rule-Based (Explainable)":
+        final_action, _ = get_advice(action, ticker, rsi, price)
+        st.caption("Engine: Rule-Based")
+        return final_action, None
+
+    # Bug fix: original call passed 4 positional args but the function
+    # only accepts 3 (df_feat, signal_action, confidence_threshold).
+    rl_action, q_str, confident = get_rl_recommendation(
+        df_feat, action, config.confidence_threshold,
+    )
+    if rl_action is not None and confident:
+        st.caption("Engine: RL (confident)")
+        return rl_action, q_str
+
+    reason = "low-confidence" if q_str and "margin" in q_str else "failed"
+    st.caption(f"Engine: Rule-Based (RL {reason}: {q_str})")
+    final_action, _ = get_advice(action, ticker, rsi, price)
+    return final_action, q_str
+
+
+def _generate_explanation(config: AppConfig, summary, ticker, action,
+                          rsi, price, final_action, q_str) -> str:
+    from llm_advisor import generate_explanation
+
+    if config.use_llm:
+        with st.spinner("Generating LLM explanation..."):
+            text = generate_explanation(
+                summary=summary, ticker=ticker, analyst_action=action,
+                rsi=rsi, price=price, final_action=final_action,
+                q_str=q_str, model=config.llm_model,
+            )
+        st.caption("Explanation source: Ollama LLM")
+    else:
+        text = generate_explanation(
+            summary=summary, ticker=ticker, analyst_action=action,
+            rsi=rsi, price=price, final_action=final_action,
+            q_str=q_str, model=None,
+        )
+        st.caption("Explanation source: template")
+    return text
+
+
+# ======================================================================
+# Entry point
+# ======================================================================
+
+def main() -> None:
+    st.set_page_config(page_title="Financial Advisor Bot", layout="wide")
+    st.title("Financial Advisor Bot")
+
+    config = render_sidebar()
+    render_model_registry()
+    render_model_selection()
+    render_gold_evaluation()
+    render_evaluation_suite(config.rl_available)
+    render_corpus_maintenance()
+    render_training_form()
+    render_training_history()
+    render_scraper()
+    render_analysis(config)
+
+
+def _init_session_state() -> None:
+    for key, default in SESSION_DEFAULTS.items():
+        if key not in st.session_state:
+            st.session_state[key] = default
+
+
+if __name__ == "__main__":
+    _init_session_state()
+    _reconstruct_training_state()  # Rebuild in-progress state from disk.
+    main()-e 
+
+================================================================================
+FILE: ./build_corpus.py
+================================================================================
+
+import time
+from datetime import datetime, timedelta
+
+import finnhub
+import pandas as pd
+
+FINNHUB_KEY = "daikevpr01qqjcj45d60daikevpr01qqjcj45d6g"
+
+TICKERS = [
+    # Tech
+    "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META",
+    "AMD", "NFLX", "INTC", "ORCL", "CRM", "ADBE", "AVGO", "QCOM",
+    "TXN", "MU", "IBM", "CSCO", "UBER", "ABNB", "PYPL", "SHOP",
+    "COIN", "SNOW", "PLTR", "SQ", "ZM", "DOCU", "ROKU",
+    # Finance
+    "JPM", "BAC", "GS", "MS", "WFC", "C", "SCHW", "BLK", "AXP",
+    "USB", "PNC", "TFC",
+    # Energy
+    "XOM", "CVX", "COP", "EOG", "SLB",
+    # Healthcare
+    "JNJ", "PFE", "LLY", "UNH", "MRK", "ABBV", "TMO", "DHR",
+    "ABT", "BMY", "GILD", "AMGN",
+    # Industrial
+    "HON", "CAT", "DE", "LMT", "RTX", "MMM", "UPS", "FDX",
+    "BA", "GE",
+    # Consumer
+    "WMT", "PG", "KO", "PEP", "MCD", "SBUX", "NKE", "HD", "LOW",
+    "TGT", "COST", "CVS", "WBA", "DIS",
+]
+
+DAYS_BACK = 365  # was 180
+
+client = finnhub.Client(api_key=FINNHUB_KEY)
+
+end = datetime.now().strftime("%Y-%m-%d")
+start = (datetime.now() - timedelta(days=DAYS_BACK)).strftime("%Y-%m-%d")
+
+rows = []
+for ticker in TICKERS:
+    try:
+        news = client.company_news(ticker, _from=start, to=end)
+    except Exception as e:
+        print(f"{ticker}: {e}")
+        continue
+
+    kept = 0
+    for art in news:
+        headline = art.get("headline", "") or ""
+        content = art.get("summary", "") or ""
+        if len(content) < 80:
+            continue
+        rows.append({
+            "ticker": ticker,
+            "headline": headline,
+            "content": content,
+            "published": art.get("datetime", ""),
+            "source": art.get("source", ""),
+            "url": art.get("url", ""),
+        })
+        kept += 1
+    print(f"{ticker}: {kept} articles kept (of {len(news)} returned)")
+    time.sleep(1.1)  # 60 req/min limit
+
+if not rows:
+    print("No articles retrieved. Check your Finnhub key.")
+    raise SystemExit(2)
+
+df = pd.DataFrame(rows)
+df = df.drop_duplicates(subset=["headline", "content"]).reset_index(drop=True)
+df.to_csv("eulerpool_corpus.csv", sep=";", index=False)
+print(f"Pulled {len(df)} articles → eulerpool_corpus.csv")
+print(f"Unique tickers: {df['ticker'].nunique()}")
+print(f"Avg content length:  {df['content'].str.len().mean():.0f} chars")
+print(f"Avg headline length: {df['headline'].str.len().mean():.0f} chars")
+-e 
+
+================================================================================
+FILE: ./build_gold_set.py
+================================================================================
+
+"""
+Build a fresh evaluation gold set from Finnhub news headlines.
+
+Uses DIFFERENT tickers than build_corpus.py, so no row here overlaps with
+the training corpus. Headlines are human-written abstractive summaries,
+which makes them a legitimate reference standard.
+"""
+import time
+from datetime import datetime, timedelta
+
+import finnhub
+import pandas as pd
+
+FINNHUB_KEY = "daikevpr01qqjcj45d60daikevpr01qqjcj45d6g"
+
+# Completely different from the training tickers in build_corpus.py
+GOLD_TICKERS = [
+    "ORCL", "CRM", "ADBE", "AVGO", "QCOM", "TXN", "MU", "IBM",
+    "CSCO", "UBER", "ABNB", "PYPL", "SHOP", "COIN",
+    "GS", "MS", "WFC", "C", "SCHW", "BLK",
+    "LLY", "UNH", "MRK", "ABBV", "TMO",
+    "HON", "CAT", "DE", "LMT", "RTX",
+]
+
+TARGET_ROWS = 250  # cap the gold set at ~250 examples
+
+client = finnhub.Client(api_key=FINNHUB_KEY)
+
+end = datetime.now().strftime("%Y-%m-%d")
+start = (datetime.now() - timedelta(days=180)).strftime("%Y-%m-%d")
+
+rows = []
+for ticker in GOLD_TICKERS:
+    if len(rows) >= TARGET_ROWS:
+        break
+    try:
+        news = client.company_news(ticker, _from=start, to=end)
+    except Exception as e:
+        print(f"{ticker}: {e}")
+        continue
+
+    kept = 0
+    for art in news:
+        headline = (art.get("headline") or "").strip()
+        content = (art.get("summary") or "").strip()
+        # Require real abstractive references:
+        if len(content) < 100 or len(headline) < 25:
+            continue
+        # A summary should be shorter than the text
+        if len(headline) >= len(content):
+            continue
+        rows.append({
+            "cleaned_text": content,
+            "summary": headline,
+            "ticker": ticker,
+            "published": art.get("datetime", ""),
+            "source": art.get("source", ""),
+        })
+        kept += 1
+        if len(rows) >= TARGET_ROWS:
+            break
+    print(f"{ticker}: +{kept} (total {len(rows)})")
+    time.sleep(1.1)  # 60 req/min
+
+if not rows:
+    print("No gold rows collected. Check the Finnhub key.")
+    raise SystemExit(2)
+
+df = pd.DataFrame(rows)
+df.to_csv("gold_set_v2.csv", sep=";", index=False)
+print(f"Wrote {len(df)} gold examples → gold_set_v2.csv")
+print(f"Avg text len:    {df['cleaned_text'].str.len().mean():.0f} chars")
+print(f"Avg summary len: {df['summary'].str.len().mean():.0f} chars")
+-e 
+
+================================================================================
+FILE: ./build_hf_corpus.py
+================================================================================
+
+import os
+
+import pandas as pd
+from datasets import load_dataset
+
+# Datasets to try.
+DATASETS = [
+    "mxlcw/telegram-financial-sentiment-summarization",
+    "ZombitX64/telegram-financial-signalsv2",
+    "cnn_dailymail",  # add for real summaries
+]
+
+# Candidate column names - ORDER MATTERS. Put real summary columns first.
+TEXT_CANDIDATES = [
+    "text", "cleaned_text", "content", "body", "post", "message", "article",
+]
+SUMMARY_CANDIDATES = [
+    # Real summary candidates FIRST - never put "label" or "target" here
+    "summarized_text", "summary", "highlights", "headline",
+    "title", "abstract", "short_text",
+]
+
+# A summary should be reasonably shorter than the text.
+MAX_SUMMARY_TO_TEXT_RATIO = 0.8
+MIN_SUMMARY_CHARS = 15
+MIN_TEXT_CHARS = 80
+
+
+def pick_column(columns, candidates):
+    lower_map = {c.lower(): c for c in columns}
+    for cand in candidates:
+        if cand in lower_map:
+            return lower_map[cand]
+    return None
+
+
+def looks_like_summary(text_series, summary_series):
+    """Sanity-check: are summary strings actually short-ish text, not labels?"""
+    t = text_series.astype(str)
+    s = summary_series.astype(str)
+
+    avg_t = t.str.len().mean()
+    avg_s = s.str.len().mean()
+    if avg_s == 0 or avg_t == 0:
+        return False, f"avg len text={avg_t:.0f}, summary={avg_s:.0f}"
+
+    ratio = avg_s / avg_t
+    if ratio > MAX_SUMMARY_TO_TEXT_RATIO:
+        return False, f"summary too long (avg {avg_s:.0f} vs text {avg_t:.0f})"
+
+    # Also reject when the "summary" is a tiny vocabulary (labels!)
+    unique_ratio = s.nunique() / max(len(s), 1)
+    if unique_ratio < 0.01:
+        return False, f"only {s.nunique()} unique values out of {len(s)} - looks like labels"
+
+    return True, f"avg len text={avg_t:.0f}, summary={avg_s:.0f}"
+
+
+def process_dataset(name, out_dir="hf_raw"):
+    print(f"=== {name} ===")
+    try:
+        ds = load_dataset(name)
+    except Exception as e:
+        print(f"Could not load: {e}")
+        return None
+
+    split_name = "train" if "train" in ds else list(ds.keys())[0]
+    df = ds[split_name].to_pandas()
+    print(f"Split: {split_name} | rows: {len(df)}")
+    print(f"Columns: {list(df.columns)}")
+
+    text_col = pick_column(df.columns, TEXT_CANDIDATES)
+    summary_col = pick_column(df.columns, SUMMARY_CANDIDATES)
+
+    if text_col is None or summary_col is None:
+        print(f"No real summary column found "
+              f"(text={text_col}, summary={summary_col}). Skipping.")
+        return None
+    print(f"Using text='{text_col}', summary='{summary_col}'")
+
+    out = df[[text_col, summary_col]].rename(
+        columns={text_col: "cleaned_text", summary_col: "summary"}
+    )
+
+    out = out.dropna()
+    out["cleaned_text"] = out["cleaned_text"].astype(str).str.strip()
+    out["summary"] = out["summary"].astype(str).str.strip()
+    out = out[(out["cleaned_text"].str.len() > MIN_TEXT_CHARS) &
+              (out["summary"].str.len() > MIN_SUMMARY_CHARS)]
+
+    if out.empty:
+        print(f"No rows after basic filtering. Skipping.")
+        return None
+
+    ok, msg = looks_like_summary(out["cleaned_text"], out["summary"])
+    print(f"Sanity check: {'good' if ok else 'bad'} {msg}")
+    if not ok:
+        print(f"Summary column does not look like real summaries. Skipping.")
+        return None
+
+    os.makedirs(out_dir, exist_ok=True)
+    safe_name = name.replace("/", "__")
+    per_file = os.path.join(out_dir, f"{safe_name}.csv")
+    out.to_csv(per_file, sep=";", index=False)
+    print(f"Saved {len(out)} rows → {per_file}")
+    return out
+
+
+def main():
+    frames = []
+    for name in DATASETS:
+        df = process_dataset(name)
+        if df is not None and not df.empty:
+            frames.append(df)
+
+    if not frames:
+        print("No datasets produced usable rows.")
+        return
+
+    combined = pd.concat(frames, ignore_index=True)
+    combined = combined.drop_duplicates(subset=["cleaned_text"])
+    combined.to_csv("hf_telegram_corpus.csv", sep=";", index=False)
+    print(f"Combined HuggingFace corpus: ")
+    print(f"{len(combined)} rows → hf_telegram_corpus.csv")
+
+
+if __name__ == "__main__":
+    main()
+-e 
+
+================================================================================
+FILE: ./build_rss_corpus.py
+================================================================================
+
+"""
+RSS-feed corpus builder.
+
+Pulls headlines + body text from free financial RSS feeds (no API key
+required). Writes `rss_corpus.csv` with the same schema as
+`eulerpool_corpus.csv` so it can be merged into the training pipeline.
+
+Each feed has a hard per-request timeout (default 8s). Feeds that fail or
+time out are skipped and reported, so the script never hangs.
+
+Run:
+    python build_rss_corpus.py
+    python build_rss_corpus.py --timeout 5     # override per-feed timeout
+"""
+import argparse
+import re
+import time
+
+import feedparser
+import pandas as pd
+import requests
+
+GLOBAL_FEEDS = [
+    "https://finance.yahoo.com/news/rssindex",
+    "https://feeds.marketwatch.com/marketwatch/topstories/",
+    "https://feeds.marketwatch.com/marketwatch/marketpulse/",
+    "https://search.cnbc.com/rs/search/combinedcms/view.xml?partnerId=wrss01&id=100003114",
+    "https://www.investing.com/rss/news.rss",
+    "https://www.investing.com/rss/news_25.rss",
+    "https://seekingalpha.com/market_currents.xml",
+    "https://www.nasdaq.com/feed/rssoutbound?category=Markets",
+    "https://www.nasdaq.com/feed/rssoutbound?category=Stocks",
+]
+
+YAHOO_TICKERS = [
+    # Tech
+    "AAPL", "MSFT", "NVDA", "TSLA", "AMZN", "GOOGL", "META",
+    "AMD", "NFLX", "INTC", "ORCL", "CRM", "ADBE", "AVGO", "QCOM",
+    "TXN", "MU", "IBM", "CSCO", "UBER", "ABNB", "PYPL", "SHOP",
+    "COIN",
+    # Finance
+    "JPM", "BAC", "GS", "MS", "WFC", "C", "SCHW", "BLK", "AXP",
+    # Energy / industrial
+    "XOM", "CVX", "COP", "HON", "CAT", "DE", "LMT", "RTX", "BA", "GE",
+    # Healthcare
+    "JNJ", "PFE", "LLY", "UNH", "MRK", "ABBV", "TMO",
+    # Consumer
+    "WMT", "DIS", "PG", "KO", "PEP", "MCD", "SBUX", "NKE", "HD", "COST",
+]
+
+MIN_CONTENT_CHARS = 80
+MIN_HEADLINE_CHARS = 20
+
+# User-Agent helps with feeds that block default Python clients
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "application/rss+xml, application/xml, text/xml, */*",
+}
+
+DEFAULT_TIMEOUT = 8  # seconds per feed
+
+
+def _clean_html(s):
+    if not s:
+        return ""
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
+
+
+def _extract_entries(feed_url, ticker="", timeout=DEFAULT_TIMEOUT):
+    """
+    Fetch feed with a hard timeout, then parse. Returns a list of row dicts.
+    Never raises: any error is reported and treated as an empty result.
+    """
+    out = []
+    try:
+        # Two-stage timeout: (connect_timeout, read_timeout)
+        resp = requests.get(
+            feed_url,
+            headers=HEADERS,
+            timeout=(timeout, timeout),
+            allow_redirects=True,
+        )
+    except requests.exceptions.Timeout:
+        print(f"timeout after {timeout}s")
+        return out
+    except requests.exceptions.RequestException as e:
+        print(f"request failed: {type(e).__name__}: {e}")
+        return out
+
+    if resp.status_code != 200:
+        print(f"HTTP {resp.status_code}")
+        return out
+
+    try:
+        feed = feedparser.parse(resp.content)
+    except Exception as e:
+        print(f"parse failed: {type(e).__name__}: {e}")
+        return out
+
+    if feed.bozo and not feed.entries:
+        print(f"malformed feed: {getattr(feed, 'bozo_exception', '?')}")
+        return out
+
+    for entry in feed.entries:
+        headline = _clean_html(entry.get("title", ""))
+        content = _clean_html(
+            entry.get("summary", "") or entry.get("description", "")
+        )
+        if len(headline) < MIN_HEADLINE_CHARS:
+            continue
+        if len(content) < MIN_CONTENT_CHARS:
+            continue
+        out.append({
+            "ticker": ticker,
+            "headline": headline,
+            "content": content,
+            "published": entry.get("published", "") or entry.get("updated", ""),
+            "source": "rss:" + feed_url.split("/")[2],
+            "url": entry.get("link", ""),
+        })
+    return out
+
+
+def _host(url):
+    try:
+        return url.split("/")[2]
+    except IndexError:
+        return url
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT,
+                    help=f"Per-feed timeout in seconds (default {DEFAULT_TIMEOUT})")
+    ap.add_argument("--out", default="rss_corpus.csv",
+                    help="Output CSV path (default rss_corpus.csv)")
+    args = ap.parse_args()
+
+    rows = []
+
+    print(f"Global feeds ({len(GLOBAL_FEEDS)}) — timeout {args.timeout}s each:")
+    for url in GLOBAL_FEEDS:
+        print(f"→ {_host(url)} ", end="", flush=True)
+        ents = _extract_entries(url, ticker="", timeout=args.timeout)
+        print(f"({len(ents)} entries)")
+        rows.extend(ents)
+        time.sleep(0.3)
+
+    print(f"Per-ticker Yahoo Finance feeds ({len(YAHOO_TICKERS)}):")
+    total = 0
+    for t in YAHOO_TICKERS:
+        url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={t}&region=US&lang=en-US"
+        ents = _extract_entries(url, ticker=t, timeout=args.timeout)
+        total += len(ents)
+        if ents:
+            print(f"{t}: +{len(ents)}")
+        else:
+            print(f"·  {t}: 0")
+        rows.extend(ents)
+        time.sleep(0.2)
+    print(f"└─ per-ticker total: {total}")
+
+    if not rows:
+        print("No entries collected. Check your internet connection "
+              "or try a larger --timeout.")
+        raise SystemExit(2)
+
+    df = pd.DataFrame(rows)
+    df = df.drop_duplicates(subset=["headline", "content"]).reset_index(drop=True)
+    df.to_csv(args.out, sep=";", index=False)
+
+    print(f"Wrote {len(df)} RSS entries → {args.out}")
+    print(f"Unique tickers: {df['ticker'].nunique()}")
+    print(f"Avg content len:  {df['content'].str.len().mean():.0f} chars")
+    print(f"Avg headline len: {df['headline'].str.len().mean():.0f} chars")
+
+
+if __name__ == "__main__":
+    main()
+-e 
+
+================================================================================
+FILE: ./evaluate_rl.py
+================================================================================
+
+"""
+Compare the trained RL agent against four baselines on the held-out test set.
+
+Strategies:
+  1. RL (DQN)
+  2. Buy & Hold
+  3. Rule-Based advisor (RSI-filtered)
+  4. Signal-Only (follow analyst signal directly)
+  5. Random policy
+
+Outputs:
+  - rl_comparison.csv     (metrics table)
+  - rl_equity_curves.png  (equity curves for the report)
+
+Run from project root:
+    python evaluate_rl.py
+"""
+import os
+import random
+
+import backtrader as bt
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+from advisor import get_advice
+
+
+def load_test_data():
+    if not os.path.exists("rl_test_set.pkl"):
+        raise FileNotFoundError(
+            "rl_test_set.pkl not found. Re-run RL training (from the UI) "
+            "so the split is saved."
+        )
+    return pd.read_pickle("rl_test_set.pkl")
+
+
+def load_agent():
+    if not os.path.exists("dqn_model.pth"):
+        raise FileNotFoundError("dqn_model.pth not found. Train the RL agent first.")
+    from RL.rl_agent import DQNAgent
+    agent = DQNAgent(state_dim=7, action_dim=3)
+    agent.load("dqn_model.pth")
+    return agent
+
+
+# ----------------------------------------------------------------------
+# Strategies
+# ----------------------------------------------------------------------
+class EquityCurve(bt.Analyzer):
+    def start(self):
+        self.values = []
+        self.dates = []
+        self.trades = 0
+
+    def next(self):
+        self.values.append(self.strategy.broker.getvalue())
+        self.dates.append(self.strategy.datas[0].datetime.date(0))
+
+    def notify_trade(self, trade):
+        if trade.isclosed:
+            self.trades += 1
+
+    def get_analysis(self):
+        return {"values": self.values, "dates": self.dates, "n_trades": self.trades}
+
+
+class DQNStrategy(bt.Strategy):
+    params = (("agent", None), ("signal_series", None), ("features_df", None))
+
+    def __init__(self):
+        self.agent = self.params.agent
+        self.signal_series = self.params.signal_series.reset_index(drop=True)
+        self.features_df = self.params.features_df.reset_index(drop=True)
+        self.idx = 0
+
+    def _size(self):
+        cash = self.broker.getcash()
+        price = float(self.data.close[0])
+        return max(int(cash * 0.95 / price), 0)
+
+    def next(self):
+        if self.idx >= len(self.features_df):
+            return
+        row = self.features_df.iloc[self.idx]
+        state = np.array([
+            float(row['returns']),
+            float(row['rsi']) / 100.0,
+            float(row['macd']),
+            (float(row['Close']) - float(row['sma_20'])) / float(row['sma_20']),
+            (float(row['Close']) - float(row['sma_50'])) / float(row['sma_50']),
+            float(row['volume_ratio']),
+            float(self.signal_series.iloc[self.idx]) / 2.0,
+        ], dtype=np.float32)
+        action = self.agent.act(state, training=False)
+        if action == 1 and not self.position:
+            sz = self._size()
+            if sz > 0:
+                self.buy(size=sz)
+        elif action == 2 and self.position:
+            self.sell(size=self.position.size)
+        self.idx += 1
+
+
+class BuyAndHold(bt.Strategy):
+    def __init__(self):
+        self.bought = False
+
+    def next(self):
+        if not self.bought:
+            cash = self.broker.getcash()
+            price = float(self.data.close[0])
+            sz = int(cash * 0.99 / price)
+            if sz > 0:
+                self.buy(size=sz)
+                self.bought = True
+
+
+class RuleBased(bt.Strategy):
+    params = (("signal_series", None), ("features_df", None))
+
+    def __init__(self):
+        self.signal_series = self.params.signal_series.reset_index(drop=True)
+        self.features_df = self.params.features_df.reset_index(drop=True)
+        self.idx = 0
+
+    def _size(self):
+        cash = self.broker.getcash()
+        price = float(self.data.close[0])
+        return max(int(cash * 0.95 / price), 0)
+
+    def next(self):
+        if self.idx >= len(self.features_df):
+            return
+        row = self.features_df.iloc[self.idx]
+        sig = int(self.signal_series.iloc[self.idx])
+        act_word = {0: "hold", 1: "buy", 2: "sell"}.get(sig, "hold")
+        final_action, _ = get_advice(act_word, "X", float(row['rsi']), float(row['Close']))
+        if final_action == "BUY" and not self.position:
+            sz = self._size()
+            if sz > 0:
+                self.buy(size=sz)
+        elif final_action == "SELL" and self.position:
+            self.sell(size=self.position.size)
+        self.idx += 1
+
+
+class SignalOnly(bt.Strategy):
+    params = (("signal_series", None),)
+
+    def __init__(self):
+        self.signal_series = self.params.signal_series.reset_index(drop=True)
+        self.idx = 0
+
+    def _size(self):
+        cash = self.broker.getcash()
+        price = float(self.data.close[0])
+        return max(int(cash * 0.95 / price), 0)
+
+    def next(self):
+        if self.idx >= len(self.signal_series):
+            return
+        sig = int(self.signal_series.iloc[self.idx])
+        if sig == 1 and not self.position:
+            sz = self._size()
+            if sz > 0:
+                self.buy(size=sz)
+        elif sig == 2 and self.position:
+            self.sell(size=self.position.size)
+        self.idx += 1
+
+
+class RandomPolicy(bt.Strategy):
+    params = (("seed", 42),)
+
+    def __init__(self):
+        random.seed(self.params.seed)
+        np.random.seed(self.params.seed)
+
+    def _size(self):
+        cash = self.broker.getcash()
+        price = float(self.data.close[0])
+        return max(int(cash * 0.95 / price), 0)
+
+    def next(self):
+        a = np.random.randint(0, 3)
+        if a == 1 and not self.position:
+            sz = self._size()
+            if sz > 0:
+                self.buy(size=sz)
+        elif a == 2 and self.position:
+            self.sell(size=self.position.size)
+
+
+# ----------------------------------------------------------------------
+# Runner + metrics
+# ----------------------------------------------------------------------
+def run_one(strategy_cls, market_df, kwargs, initial_cash=10000, commission=0.001):
+    cerebro = bt.Cerebro()
+    cerebro.broker.setcash(initial_cash)
+    cerebro.broker.setcommission(commission=commission)
+    cerebro.adddata(bt.feeds.PandasData(dataname=market_df))
+    cerebro.addstrategy(strategy_cls, **kwargs)
+    cerebro.addanalyzer(EquityCurve, _name="eq")
+    results = cerebro.run()
+    return results[0].analyzers.eq.get_analysis()
+
+
+def compute_metrics(eq):
+    values = np.array(eq["values"], dtype=float)
+    if len(values) < 2:
+        return {}
+    returns = np.diff(values) / values[:-1]
+    n = len(values)
+    ann = 252
+
+    total_ret = (values[-1] / values[0] - 1) * 100
+    ann_ret = ((values[-1] / values[0]) ** (ann / n) - 1) * 100
+    ann_vol = np.std(returns, ddof=1) * np.sqrt(ann) * 100
+    sharpe = ann_ret / ann_vol if ann_vol > 0 else 0.0
+
+    downside = returns[returns < 0]
+    down_vol = np.std(downside, ddof=1) * np.sqrt(ann) * 100 if len(downside) > 1 else 0.0
+    sortino = ann_ret / down_vol if down_vol > 0 else 0.0
+
+    running_max = np.maximum.accumulate(values)
+    dd = (values - running_max) / running_max
+    max_dd = dd.min() * 100
+    calmar = ann_ret / abs(max_dd) if max_dd != 0 else 0.0
+
+    wins = int(np.sum(returns > 0))
+    win_rate = wins / len(returns) * 100 if len(returns) else 0.0
+
+    return {
+        "Total Return %": round(total_ret, 2),
+        "Ann. Return %": round(ann_ret, 2),
+        "Ann. Vol %": round(ann_vol, 2),
+        "Sharpe": round(sharpe, 3),
+        "Sortino": round(sortino, 3),
+        "Max DD %": round(max_dd, 2),
+        "Calmar": round(calmar, 3),
+        "Win Rate %": round(win_rate, 2),
+        "N Trades": eq["n_trades"],
+        "Final Value": round(values[-1], 2),
+    }
+
+
+def main():
+    print("Loading test set...")
+    test_df = load_test_data()
+    print(f"Test set: {len(test_df)} bars "
+          f"({test_df.index[0].date()} -> {test_df.index[-1].date()})")
+
+    print("Loading RL agent...")
+    agent = load_agent()
+
+    market_df = test_df[["Open", "High", "Low", "Close", "Volume"]].copy()
+    signal = test_df["signal"].copy()
+
+    strategies = {
+        "RL (DQN)": (DQNStrategy, {"agent": agent, "signal_series": signal, "features_df": test_df}),
+        "Buy & Hold": (BuyAndHold, {}),
+        "Rule-Based": (RuleBased, {"signal_series": signal, "features_df": test_df}),
+        "Signal-Only": (SignalOnly, {"signal_series": signal}),
+        "Random": (RandomPolicy, {}),
+    }
+
+    rows, curves = [], {}
+    for name, (cls, kw) in strategies.items():
+        print(f"Running {name}...")
+        eq = run_one(cls, market_df, kw)
+        m = compute_metrics(eq)
+        m["Strategy"] = name
+        rows.append(m)
+        curves[name] = (eq["dates"], eq["values"])
+
+    df = pd.DataFrame(rows).set_index("Strategy")
+    df = df[["Total Return %", "Ann. Return %", "Ann. Vol %", "Sharpe",
+             "Sortino", "Max DD %", "Calmar", "Win Rate %", "N Trades", "Final Value"]]
+    print("================== Comparison ==================")
+    print(df.to_string())
+    df.to_csv("rl_comparison.csv")
+    print("Saved rl_comparison.csv")
+
+    plt.figure(figsize=(12, 6))
+    for name, (dates, values) in curves.items():
+        plt.plot(dates, values, label=name, linewidth=1.8)
+    plt.xlabel("Date")
+    plt.ylabel("Portfolio Value ($)")
+    plt.title("Strategy Equity Curves on Held-Out Test Set")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig("rl_equity_curves.png", dpi=150)
+    print("Saved rl_equity_curves.png")
+
+
+if __name__ == "__main__":
+    main()
+-e 
+
+================================================================================
+FILE: ./finbert_signal.py
+================================================================================
+
+"""
+Financial sentiment classifier using ProsusAI/finbert.
+
+Returns a sentiment in {-1, 0, +1} (bearish / neutral / bullish) with a
+confidence score, so callers can use it as a numeric feature.
+"""
+import threading
+
+import torch
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+
+_MODEL_NAME = "ProsusAI/finbert"
+_tokenizer = None
+_model = None
+_lock = threading.RLock()
+
+
+def _load():
+    global _tokenizer, _model
+    with _lock:
+        if _tokenizer is not None and _model is not None:
+            return
+        _tokenizer = AutoTokenizer.from_pretrained(_MODEL_NAME)
+        _model = AutoModelForSequenceClassification.from_pretrained(_MODEL_NAME)
+        if torch.backends.mps.is_available():
+            _model.to("mps")
+        else:
+            _model.to("cpu")
+        _model.eval()
+
+
+def score(text, max_length=256):
+    """
+    Return (label, signed_value, confidence).
+
+    label      : 'positive' | 'negative' | 'neutral'
+    signed_val : +1 / -1 / 0 (useful as an RL feature)
+    confidence : probability of the winning class (0..1)
+    """
+    if not text or not isinstance(text, str):
+        return "neutral", 0, 0.0
+    _load()
+    tok = _tokenizer(text, return_tensors="pt", truncation=True, max_length=max_length)
+    device = next(_model.parameters()).device
+    tok = {k: v.to(device) for k, v in tok.items()}
+    with torch.no_grad():
+        logits = _model(**tok).logits
+    probs = torch.softmax(logits, dim=-1)[0].cpu().numpy()
+    idx = int(probs.argmax())
+    label = _model.config.id2label[idx].lower()
+    conf = float(probs[idx])
+    signed = {"positive": 1, "negative": -1}.get(label, 0)
+    return label, signed, conf
+
+
+def is_available():
+    try:
+        _load()
+        return True
+    except Exception:
+        return False
+-e 
+
+================================================================================
+FILE: ./llm_advisor.py
+================================================================================
+
+"""
+Natural-language explanation generator using a local Ollama model.
+
+Turns structured advisor output (summary, ticker, action, RSI, RL Q-values)
+into a short prose explanation for a non-technical user. This is the
+"tool-using agent" layer described in the project brief.
+
+If Ollama is not running on localhost:11434, generate_explanation()
+falls back to a deterministic template so the UI never breaks.
+
+Environment variables:
+    OLLAMA_URL   default http://localhost:11434
+    OLLAMA_MODEL default llama3.2:1b   (small enough for an 8GB Mac)
+"""
+import json
+import os
+import urllib.error
+import urllib.request
+
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "llama3.2:1b")
+
+_ollama_available = None  # cached after first probe
+
+
+def _check_ollama(timeout=2):
+    """Probe once and cache the result."""
+    global _ollama_available
+    if _ollama_available is not None:
+        return _ollama_available
+    try:
+        with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=timeout) as r:
+            _ollama_available = (r.status == 200)
+    except Exception:
+        _ollama_available = False
+    return _ollama_available
+
+
+def is_available():
+    """Public check used by the UI."""
+    return _check_ollama()
+
+
+def list_models():
+    """Return the list of locally available Ollama models."""
+    if not _check_ollama():
+        return []
+    try:
+        with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=5) as r:
+            data = json.loads(r.read().decode())
+        return [m["name"] for m in data.get("models", [])]
+    except Exception:
+        return []
+
+
+def _template_explanation(summary, ticker, analyst_action, rsi, price, final_action):
+    """Deterministic fallback so the UI always has something to show."""
+    direction = {"BUY": "a bullish", "SELL": "a bearish", "HOLD": "a neutral"}
+    rsi_note = ""
+    if rsi >= 70:
+        rsi_note = f"RSI at {rsi:.1f} flags overbought conditions, "
+    elif rsi <= 30:
+        rsi_note = f"RSI at {rsi:.1f} flags oversold conditions, "
+    else:
+        rsi_note = f"RSI at {rsi:.1f} is neutral, "
+
+    return (
+        f"{ticker} shows {direction.get(final_action, 'a neutral')} setup. "
+        f"{rsi_note}with the analyst signal reading '{analyst_action}'. "
+        f"At ${price:.2f}, the recommended action is {final_action}. "
+        f"Summary context: {summary[:180]}..."
+    )
+
+
+def generate_explanation(summary, ticker, analyst_action, rsi, price,
+                         final_action, q_str=None, model=None, timeout=60):
+    """
+    Generate a natural-language explanation.
+
+    Returns a string. Uses Ollama if available, template fallback otherwise.
+    """
+    if not _check_ollama():
+        return _template_explanation(summary, ticker, analyst_action, rsi, price, final_action)
+
+    model = model or OLLAMA_MODEL
+
+    q_line = f"Reinforcement-learning Q-values: {q_str}." if q_str else ""
+    prompt = (
+        "You are a financial advisor bot explaining a recommendation to a "
+        "non-technical user. Write 2-3 sentences. Be concrete, no hedging, "
+        "no disclaimers, no markdown. Do not invent numbers or comparisons.\n\n"
+        f"Ticker: {ticker}\n"
+        f"News summary: {summary}\n"
+        f"Analyst signal: {analyst_action}\n"
+        f"RSI reading: {'overbought' if rsi >= 70 else 'oversold' if rsi <= 30 else 'neutral'}\n"
+        f"Final action: {final_action}\n"
+        f"{q_line}\n"
+        "Explanation:"
+    )
+
+    body = json.dumps({
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": 0.3, "num_predict": 120},
+    }).encode("utf-8")
+
+    req = urllib.request.Request(
+        f"{OLLAMA_URL}/api/generate",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode())
+        text = (data.get("response") or "").strip()
+        if text:
+            return text
+        return _template_explanation(summary, ticker, analyst_action, rsi, price, final_action)
+    except Exception as e:
+        return _template_explanation(summary, ticker, analyst_action, rsi, price, final_action) + \
+            f"\n\n[LLM unavailable: {type(e).__name__}]"
+-e 
+
+================================================================================
+FILE: ./market_data_providers.py
+================================================================================
+
+import os
+
+import pandas as pd
+import requests
+import yfinance as yf
+
+
+class MarketDataProvider:
+    """Base class for market data providers."""
+
+    def get_stock_data(self, ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
+        raise NotImplementedError
+
+    def get_quote(self, ticker: str) -> dict:
+        raise NotImplementedError
+
+
+class YahooFinanceProvider(MarketDataProvider):
+    """Yahoo Finance data provider (free, no API key)."""
+
+    def get_stock_data(self, ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
+        return yf.download(ticker, start=start_date, end=end_date, progress=False)
+
+    def get_quote(self, ticker: str) -> dict:
+        ticker_obj = yf.Ticker(ticker)
+        return ticker_obj.info
+
+
+class AlphaVantageProvider(MarketDataProvider):
+    """Alpha Vantage API provider (requires free API key)."""
+
+    def __init__(self, api_key: str = None):
+        self.api_key = api_key or os.environ.get("ALPHA_VANTAGE_API_KEY", "demo")
+        self.base_url = "https://www.alphavantage.co/query"
+
+    def get_stock_data(self, ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
+        params = {
+            "function": "TIME_SERIES_DAILY_ADJUSTED",
+            "symbol": ticker,
+            "outputsize": "compact",
+            "apikey": self.api_key,
+            "datatype": "json"
+        }
+        response = requests.get(self.base_url, params=params)
+        if response.status_code != 200:
+            raise Exception(f"Alpha Vantage API error: {response.status_code}")
+
+        data = response.json()
+        if "Time Series (Daily)" not in data:
+            raise Exception(f"Alpha Vantage error: {data.get('Note', 'Unknown error')}")
+
+        # Parse to DataFrame
+        ts = data["Time Series (Daily)"]
+        df_data = []
+        for date, values in ts.items():
+            if start_date <= date <= end_date:
+                df_data.append({
+                    "Date": date,
+                    "Open": float(values["1. open"]),
+                    "High": float(values["2. high"]),
+                    "Low": float(values["3. low"]),
+                    "Close": float(values["5. adjusted close"]),
+                    "Volume": int(values["6. volume"])
+                })
+
+        df = pd.DataFrame(df_data)
+        df["Date"] = pd.to_datetime(df["Date"])
+        df.set_index("Date", inplace=True)
+        return df.sort_index()
+
+    def get_quote(self, ticker: str) -> dict:
+        params = {
+            "function": "GLOBAL_QUOTE",
+            "symbol": ticker,
+            "apikey": self.api_key
+        }
+        response = requests.get(self.base_url, params=params)
+        if response.status_code != 200:
+            raise Exception(f"Alpha Vantage API error: {response.status_code}")
+
+        data = response.json()
+        if "Global Quote" not in data:
+            raise Exception(f"Alpha Vantage error: {data.get('Note', 'Unknown error')}")
+
+        quote = data["Global Quote"]
+        return {
+            "price": float(quote.get("05. price", 0)),
+            "change": float(quote.get("09. change", 0)),
+            "change_percent": float(quote.get("10. change percent", "0%").replace("%", ""))
+        }
+
+
+class TwelveDataProvider(MarketDataProvider):
+    """Twelve Data API provider (free tier)."""
+
+    def __init__(self, api_key: str = None):
+        self.api_key = api_key or os.environ.get("TWELVE_DATA_API_KEY")
+        self.base_url = "https://api.twelvedata.com"
+
+    def get_stock_data(self, ticker: str, start_date: str, end_date: str) -> pd.DataFrame:
+        if not self.api_key:
+            raise Exception("Twelve Data API key not configured")
+
+        params = {
+            "symbol": ticker,
+            "interval": "1day",
+            "start_date": start_date,
+            "end_date": end_date,
+            "apikey": self.api_key,
+            "outputsize": 1000
+        }
+        response = requests.get(f"{self.base_url}/time_series", params=params)
+        if response.status_code != 200:
+            raise Exception(f"Twelve Data API error: {response.status_code}")
+
+        data = response.json()
+        if "values" not in data:
+            raise Exception(f"Twelve Data error: {data.get('status', 'Unknown error')}")
+
+        # Parse to DataFrame
+        df_data = []
+        for entry in data["values"]:
+            df_data.append({
+                "Date": entry["datetime"],
+                "Open": float(entry["open"]),
+                "High": float(entry["high"]),
+                "Low": float(entry["low"]),
+                "Close": float(entry["close"]),
+                "Volume": int(entry["volume"])
+            })
+
+        df = pd.DataFrame(df_data)
+        df["Date"] = pd.to_datetime(df["Date"])
+        df.set_index("Date", inplace=True)
+        return df.sort_index()
+
+    def get_quote(self, ticker: str) -> dict:
+        if not self.api_key:
+            raise Exception("Twelve Data API key not configured")
+
+        params = {
+            "symbol": ticker,
+            "apikey": self.api_key
+        }
+        response = requests.get(f"{self.base_url}/price", params=params)
+        if response.status_code != 200:
+            raise Exception(f"Twelve Data API error: {response.status_code}")
+
+        data = response.json()
+        return {"price": float(data.get("price", 0))}
+
+
+def get_provider(provider_name: str = "yfinance"):
+    """Factory function to get the appropriate provider."""
+    providers = {
+        "yfinance": YahooFinanceProvider,
+        "alphavantage": AlphaVantageProvider,
+        "twelvedata": TwelveDataProvider,
+    }
+    provider_class = providers.get(provider_name.lower())
+    if provider_class is None:
+        raise ValueError(f"Unknown provider: {provider_name}")
+    return provider_class()
+
+
+def get_market_data_with_provider(ticker: str, start_date: str, end_date: str, provider: str = "yfinance"):
+    """Get market data using the specified provider."""
+    provider_instance = get_provider(provider)
+    try:
+        return provider_instance.get_stock_data(ticker, start_date, end_date)
+    except Exception as e:
+        print(f"Provider {provider} failed: {e}")
+        # Fallback to yfinance
+        if provider != "yfinance":
+            print("Falling back to yfinance...")
+            return YahooFinanceProvider().get_stock_data(ticker, start_date, end_date)
+        raise
+-e 
+
+================================================================================
+FILE: ./market_data.py
+================================================================================
+
+from datetime import datetime
+
+import yfinance as yf
+
+
+def get_market_data(ticker, start_date, end_date=None):
+    """Fetch OHLCV data for ticker between start_date and end_date."""
+    if end_date is None:
+        end_date = datetime.now().strftime('%Y-%m-%d')
+    df = yf.download(ticker, start=start_date, end=end_date, progress=False)
+
+    # Newer yfinance returns MultiIndex columns like ('Close', 'C').
+    # Flatten to single-level 'Close', 'Open', ...
+    if hasattr(df.columns, "nlevels") and df.columns.nlevels > 1:
+        df.columns = df.columns.get_level_values(0)
+
+    return df
+
+
+def compute_features(df):
+    """
+    Add technical indicators to the DataFrame.
+    Returns DataFrame with columns: returns, rsi, macd, sma_20, sma_50, volume_ratio.
+    """
+    df = df.copy()
+    # Make sure Close/Volume are 1-D numeric Series
+    for col in ("Close", "Volume"):
+        if col in df.columns:
+            s = df[col]
+            if hasattr(s, "squeeze"):
+                s = s.squeeze()
+            df[col] = s.astype(float)
+
+    df['returns'] = df['Close'].pct_change()
+    df['sma_20'] = df['Close'].rolling(20).mean()
+    df['sma_50'] = df['Close'].rolling(50).mean()
+
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
+    rs = gain / loss
+    df['rsi'] = 100 - (100 / (1 + rs))
+
+    exp1 = df['Close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['Close'].ewm(span=26, adjust=False).mean()
+    df['macd'] = exp1 - exp2
+
+    df['volume_ratio'] = df['Volume'] / df['Volume'].rolling(20).mean()
+
+    df.dropna(inplace=True)
+    return df
+
+
+if __name__ == "__main__":
+    df = get_market_data("SBER.ME", "2023-01-01")
+    df_feat = compute_features(df)
+    print(df_feat.tail())
+-e 
+
+================================================================================
+FILE: ./merge_corpora.py
+================================================================================
+
+import os
+
+import pandas as pd
+
+SOURCES = {
+    "eulerpool_corpus.csv": {
+        "text": ["content", "body", "cleaned_text", "text"],
+        "summary": ["headline", "title", "summary"],
+    },
+    "rss_corpus.csv": {
+        "text": ["content", "body", "cleaned_text", "text"],
+        "summary": ["headline", "title", "summary"],
+    },
+    "hf_telegram_corpus.csv": {
+        "text": ["cleaned_text", "text"],
+        "summary": ["summary"],
+    },
+    "cnn_dailymail_corpus.csv": {
+        "text": ["article", "cleaned_text", "text"],
+        "summary": ["highlights", "summary"],
+    },
+}
+
+
+def pick(df, candidates):
+    lower = {c.lower(): c for c in df.columns}
+    for c in candidates:
+        if c in lower:
+            return lower[c]
+    return None
+
+
+def load_one(path, spec):
+    if not os.path.exists(path):
+        print(f"{path} not found, skipping")
+        return None
+
+    try:
+        df = pd.read_csv(path, sep=";")
+    except pd.errors.EmptyDataError:
+        print(f"{path} is empty (header only). Skipping")
+        return None
+
+    if df.empty:
+        print(f"{path} has 0 rows. Skipping")
+        return None
+
+    tcol = pick(df, spec["text"])
+    scol = pick(df, spec["summary"])
+    if tcol is None or scol is None:
+        print(f"{path}: cannot find text/summary columns "
+              f"(have {list(df.columns)})")
+        return None
+
+    out = df[[tcol, scol]].rename(columns={tcol: "cleaned_text",
+                                           scol: "summary"})
+    print(f"{path}: {len(out)} rows (text={tcol}, summary={scol})")
+    return out
+
+
+def main():
+    frames = []
+    for path, spec in SOURCES.items():
+        df = load_one(path, spec)
+        if df is not None and not df.empty:
+            frames.append(df)
+
+    if not frames:
+        print("No usable source files. Nothing to merge.")
+        return
+
+    train = pd.concat(frames, ignore_index=True)
+    train["cleaned_text"] = train["cleaned_text"].astype(str).str.strip()
+    train["summary"] = train["summary"].astype(str).str.strip()
+    train = train[(train["cleaned_text"].str.len() > 50) &
+                  (train["summary"].str.len() > 10)]
+    train = train.drop_duplicates(subset=["cleaned_text"])
+
+    train.to_csv("training_corpus_large.csv", sep=";", index=False)
+    print(f"Training corpus: {len(train)} examples "
+          f"→ training_corpus_large.csv")
+
+
+if __name__ == "__main__":
+    main()
+-e 
+
+================================================================================
+FILE: ./model_registry.py
+================================================================================
+
+"""
+Named model registry.
+
+Maps a user-chosen name (e.g. "expanded_v1") to the on-disk model path
+plus the hyperparameters and metrics from the training run.
+
+Stored as JSON at models/registry.json. Every read/write goes through
+this module so the file format stays consistent.
+"""
+import json
+import os
+import shutil
+from datetime import datetime
+
+REGISTRY_PATH = os.path.join("models", "registry.json")
+
+
+def _load():
+    if not os.path.exists(REGISTRY_PATH):
+        return {}
+    try:
+        with open(REGISTRY_PATH) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save(data):
+    os.makedirs(os.path.dirname(REGISTRY_PATH), exist_ok=True)
+    tmp = REGISTRY_PATH + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, REGISTRY_PATH)
+
+
+def list_models():
+    """Return the whole registry: {name: metadata}."""
+    return _load()
+
+
+def get(name):
+    """Return metadata for a single entry, or None."""
+    return _load().get(name)
+
+
+def exists(name):
+    return name in _load()
+
+
+def register(name, path, hyperparams, metrics=None, notes="", overwrite=False):
+    """
+    Register a model. `path` should point at the merged model directory.
+
+    Returns (ok, message).
+    """
+    if not name or not isinstance(name, str):
+        return False, "Name must be a non-empty string"
+    if not os.path.exists(path):
+        return False, f"Path does not exist: {path}"
+
+    data = _load()
+    if name in data and not overwrite:
+        return False, f"Name '{name}' is already taken. Pick another or set overwrite=True."
+
+    data[name] = {
+        "path": os.path.abspath(path),
+        "created": datetime.now().isoformat(),
+        "hyperparams": hyperparams or {},
+        "metrics": metrics or {},
+        "notes": notes,
+    }
+    _save(data)
+    return True, f"Registered as '{name}'"
+
+
+def update_metrics(name, metrics):
+    data = _load()
+    if name not in data:
+        return False
+    data[name]["metrics"] = metrics
+    data[name]["updated"] = datetime.now().isoformat()
+    _save(data)
+    return True
+
+
+def rename(old, new):
+    data = _load()
+    if old not in data or not new or new in data:
+        return False
+    data[new] = data.pop(old)
+    _save(data)
+    return True
+
+
+def remove(name, delete_files=False):
+    """
+    Remove an entry. If delete_files=True, also removes the on-disk run
+    directory (parent of `merged/`). Returns True on success.
+    """
+    data = _load()
+    entry = data.pop(name, None)
+    if entry is None:
+        return False
+    _save(data)
+
+    if delete_files:
+        merged_path = entry.get("path", "")
+        run_dir = os.path.dirname(merged_path)
+        models_root = os.path.abspath("./models")
+        # Safety: only delete inside ./models
+        if run_dir and os.path.abspath(run_dir).startswith(models_root):
+            shutil.rmtree(run_dir, ignore_errors=True)
+    return True
+
+
+def summary_rows():
+    """
+    Return a list of dicts suitable for rendering in a Streamlit table.
+    Sorted newest-first.
+    """
+    data = _load()
+    rows = []
+    for name, meta in data.items():
+        hp = meta.get("hyperparams", {}) or {}
+        m = meta.get("metrics", {}) or {}
+        rows.append({
+            "Name": name,
+            "Created": meta.get("created", "")[:19].replace("T", " "),
+            "r": hp.get("r", "-"),
+            "alpha": hp.get("alpha", "-"),
+            "dropout": hp.get("dropout", "-"),
+            "epochs": hp.get("num_epochs", "-"),
+            "batch": hp.get("batch_size", "-"),
+            "LR": hp.get("learning_rate", "-"),
+            "ROUGE-1": m.get("rouge1", "-"),
+            "ROUGE-L": m.get("rougeL", "-"),
+            "Notes": meta.get("notes", ""),
+        })
+    rows.sort(key=lambda r: r["Created"], reverse=True)
+    return rows
+-e 
+
+================================================================================
+FILE: ./plot_utils.py
+================================================================================
+
+import os
+
+import matplotlib.pyplot as plt
+import pandas as pd
+
+from training_logger import TrainingLogger
+
+
+def plot_training_metrics(run_id: str, output_dir: str):
+    """
+    Generate three plots from the training log of a specific run and save them
+    in <output_dir>/plots/.
+    Plots:
+      1. Training Loss vs Step (or epoch average if step not available)
+      2. Validation Loss vs Epoch
+      3. ROUGE-1 and ROUGE-L vs Epoch
+    Returns a dict with paths to the saved images.
+    """
+    logger = TrainingLogger()
+    run_data = logger.get_run_data(run_id)
+    if run_data is None:
+        print(f"No run data found for run_id: {run_id}")
+        return {}
+
+    epochs_df = pd.DataFrame(run_data.get("epochs", []))
+    if epochs_df.empty:
+        print("No epoch data found.")
+        return {}
+
+    plots_dir = os.path.join(output_dir, "plots")
+    os.makedirs(plots_dir, exist_ok=True)
+
+    saved_paths = {}
+
+    # 1. Training Loss vs Step (if step column exists, else use epoch)
+    if "train_loss" in epochs_df.columns:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        if "step" in epochs_df.columns:
+            # Use step
+            ax.plot(epochs_df["step"], epochs_df["train_loss"], marker='o', linestyle='-', linewidth=1.5)
+            ax.set_xlabel("Training Step")
+        else:
+            # Use epoch (average per epoch)
+            epoch_loss = epochs_df.groupby("epoch")["train_loss"].mean().reset_index()
+            ax.plot(epoch_loss["epoch"], epoch_loss["train_loss"], marker='o', linestyle='-', linewidth=1.5)
+            ax.set_xlabel("Epoch")
+        ax.set_ylabel("Training Loss")
+        ax.set_title("Training Loss")
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        loss_path = os.path.join(plots_dir, "training_loss.png")
+        plt.savefig(loss_path, dpi=150)
+        plt.close()
+        saved_paths["training_loss"] = loss_path
+
+    # 2. Validation Loss vs Epoch
+    if "eval_loss" in epochs_df.columns:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        # Use epoch
+        val_loss = epochs_df.groupby("epoch")["eval_loss"].mean().reset_index()
+        ax.plot(val_loss["epoch"], val_loss["eval_loss"], marker='s', linestyle='-', linewidth=1.5, color='orange')
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("Validation Loss")
+        ax.set_title("Validation Loss")
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        val_path = os.path.join(plots_dir, "validation_loss.png")
+        plt.savefig(val_path, dpi=150)
+        plt.close()
+        saved_paths["validation_loss"] = val_path
+
+    # 3. ROUGE-1 and ROUGE-L vs Epoch
+    rouge_cols = [c for c in epochs_df.columns if c.startswith("eval_rouge")]
+    if rouge_cols:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        # Use epoch average
+        epoch_group = epochs_df.groupby("epoch")
+        for col in rouge_cols:
+            if col in epochs_df.columns:
+                avg_rouge = epoch_group[col].mean().reset_index()
+                label = col.replace("eval_", "").upper()
+                ax.plot(avg_rouge["epoch"], avg_rouge[col], marker='o', linestyle='-', linewidth=1.5, label=label)
+        ax.set_xlabel("Epoch")
+        ax.set_ylabel("ROUGE Score")
+        ax.set_title("ROUGE Scores")
+        ax.legend()
+        ax.grid(True, alpha=0.3)
+        plt.tight_layout()
+        rouge_path = os.path.join(plots_dir, "rouge_scores.png")
+        plt.savefig(rouge_path, dpi=150)
+        plt.close()
+        saved_paths["rouge_scores"] = rouge_path
+
+    print(f"Plots saved to {plots_dir}")
+    return saved_paths
+-e 
+
+================================================================================
+FILE: ./RL/backtest.py
+================================================================================
+
+import backtrader as bt
+import numpy as np
+
+
+class DQNStrategy(bt.Strategy):
+    params = (
+        ('agent', None),
+        ('signal_series', None),
+        ('features_df', None),
+    )
+
+    def __init__(self):
+        self.data_close = self.datas[0].close
+        # We'll store previous portfolio value for reward? Not needed for backtest.
+        self.order = None
+        self.agent = self.params.agent
+        self.signal_series = self.params.signal_series
+        self.features_df = self.params.features_df
+        self.idx = 0  # index in features_df
+
+    def next(self):
+        if self.idx >= len(self.features_df):
+            return
+        # Get current state
+        row = self.features_df.iloc[self.idx]
+        state = [
+            row['returns'],
+            row['rsi'] / 100.0,
+            row['macd'],
+            (row['Close'] - row['sma_20']) / row['sma_20'],
+            (row['Close'] - row['sma_50']) / row['sma_50'],
+            row['volume_ratio'],
+            self.signal_series.iloc[self.idx] / 2.0
+        ]
+        state = np.array(state, dtype=np.float32)
+        # Agent acts (no exploration)
+        action = self.agent.act(state, training=False)
+        # Execute
+        if action == 1:  # buy
+            if not self.position:
+                self.buy(size=100)
+        elif action == 2:  # sell
+            if self.position:
+                self.sell(size=100)
+        # else hold
+        self.idx += 1
+
+
+def run_backtest(agent, market_df, signal_series, initial_cash=10000):
+    cerebro = bt.Cerebro()
+    cerebro.broker.setcash(initial_cash)
+    cerebro.broker.setcommission(commission=0.001)  # 0.1%
+
+    # Add data
+    data = bt.feeds.PandasData(dataname=market_df)
+    cerebro.adddata(data)
+
+    # Add strategy with agent and signal
+    cerebro.addstrategy(DQNStrategy, agent=agent, signal_series=signal_series, features_df=market_df)
+
+    # Add analyzers
+    cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe')
+    cerebro.addanalyzer(bt.analyzers.DrawDown, _name='drawdown')
+
+    print('Starting Portfolio Value: %.2f' % cerebro.broker.getvalue())
+    results = cerebro.run()
+    final_value = cerebro.broker.getvalue()
+    print('Final Portfolio Value: %.2f' % final_value)
+
+    # Get metrics
+    strat = results[0]
+    sharpe = strat.analyzers.sharpe.get_analysis().get('sharperatio', 0)
+    drawdown = strat.analyzers.drawdown.get_analysis()
+    max_drawdown = drawdown.max.drawdown if drawdown else 0
+
+    return {
+        'final_value': final_value,
+        'sharpe_ratio': sharpe,
+        'max_drawdown': max_drawdown,
+        'total_return': (final_value - initial_cash) / initial_cash * 100
+    }
+-e 
+
+================================================================================
+FILE: ./RL/rl_agent.py
+================================================================================
+
+import random
+from collections import deque
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+
+class DQN(nn.Module):
+    def __init__(self, state_dim, action_dim, hidden_dim=64):
+        super(DQN, self).__init__()
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.out = nn.Linear(hidden_dim, action_dim)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return self.out(x)
+
+
+class DQNAgent:
+    def __init__(self, state_dim, action_dim, lr=1e-3, gamma=0.99, epsilon=1.0, epsilon_decay=0.995, epsilon_min=0.01,
+                 buffer_size=10000, batch_size=32, target_update=10):
+        self.device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        self.action_dim = action_dim
+        self.gamma = gamma
+        self.epsilon = epsilon
+        self.epsilon_decay = epsilon_decay
+        self.epsilon_min = epsilon_min
+        self.batch_size = batch_size
+        self.target_update = target_update
+        self.update_counter = 0
+
+        self.q_net = DQN(state_dim, action_dim).to(self.device)
+        self.target_net = DQN(state_dim, action_dim).to(self.device)
+        self.target_net.load_state_dict(self.q_net.state_dict())
+        self.target_net.eval()
+
+        self.optimizer = optim.Adam(self.q_net.parameters(), lr=lr)
+        self.memory = deque(maxlen=buffer_size)
+
+    def remember(self, state, action, reward, next_state, done):
+        self.memory.append((state, action, reward, next_state, done))
+
+    def act(self, state, training=True):
+        if training and np.random.rand() <= self.epsilon:
+            return np.random.randint(self.action_dim)
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        q_values = self.q_net(state)
+        return q_values.argmax().item()
+
+    def replay(self):
+        if len(self.memory) < self.batch_size:
+            return
+        batch = random.sample(self.memory, self.batch_size)
+        states = torch.FloatTensor(np.array([exp[0] for exp in batch])).to(self.device)
+        actions = torch.LongTensor([exp[1] for exp in batch]).to(self.device)
+        rewards = torch.FloatTensor([exp[2] for exp in batch]).to(self.device)
+        next_states = torch.FloatTensor(np.array([exp[3] for exp in batch])).to(self.device)
+        dones = torch.BoolTensor([exp[4] for exp in batch]).to(self.device)
+
+        # Compute current Q values
+        q_values = self.q_net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        # Compute target Q values
+        next_q_values = self.target_net(next_states).max(1)[0].detach()
+        target_q_values = rewards + self.gamma * next_q_values * (~dones)
+
+        loss = nn.MSELoss()(q_values, target_q_values)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        # Update epsilon
+        if self.epsilon > self.epsilon_min:
+            self.epsilon *= self.epsilon_decay
+
+        # Update target network
+        self.update_counter += 1
+        if self.update_counter % self.target_update == 0:
+            self.target_net.load_state_dict(self.q_net.state_dict())
+
+    def save(self, path):
+        torch.save(self.q_net.state_dict(), path)
+
+    def load(self, path):
+        self.q_net.load_state_dict(torch.load(path, map_location=self.device))
+        self.target_net.load_state_dict(self.q_net.state_dict())
+-e 
+
+================================================================================
+FILE: ./RL/rl_env.py
+================================================================================
+
+import gymnasium as gym
+import numpy as np
+from gymnasium import spaces
+
+
+def _to_float(x):
+    """Convert numpy scalar / single-element Series / list to a Python float."""
+    if hasattr(x, "item"):
+        return float(x.item())
+    if hasattr(x, "iloc"):
+        return float(x.iloc[0])
+    return float(x)
+
+
+class TradingEnv(gym.Env):
+    """
+    Single-asset trading environment.
+    State: [returns, rsi, macd, sma_20_diff, sma_50_diff, volume_ratio, signal_encoded]
+    signal_encoded: 0=hold, 1=buy, 2=sell (from analyst)
+    """
+
+    def __init__(self, df_features, signal_series, initial_cash=10000, shares=100):
+        super(TradingEnv, self).__init__()
+        self.df = df_features.copy()
+        self.signal_series = signal_series
+        self.initial_cash = initial_cash
+        self.shares = shares
+        self.current_step = 0
+        self.cash = initial_cash
+        self.position = 0
+        self.previous_price = None
+        self.prev_portfolio_value = None
+
+        self.action_space = spaces.Discrete(3)
+        self.observation_space = spaces.Box(low=-np.inf, high=np.inf, shape=(7,), dtype=np.float32)
+
+    def reset(self, seed=None, options=None):
+        super().reset(seed=seed)
+        self.current_step = 0
+        self.cash = self.initial_cash
+        self.position = 0
+        self.previous_price = None
+        self.prev_portfolio_value = None
+        return self._get_obs(), {}
+
+    def _get_obs(self):
+        row = self.df.iloc[self.current_step]
+
+        close = _to_float(row['Close'])
+        sma20 = _to_float(row['sma_20'])
+        sma50 = _to_float(row['sma_50'])
+        rsi = _to_float(row['rsi'])
+        sig = _to_float(self.signal_series.iloc[self.current_step])
+
+        features = [
+            _to_float(row['returns']),
+            rsi / 100.0,
+            _to_float(row['macd']),
+            (close - sma20) / sma20 if sma20 != 0 else 0.0,
+            (close - sma50) / sma50 if sma50 != 0 else 0.0,
+            _to_float(row['volume_ratio']),
+            sig / 2.0,
+        ]
+        return np.array(features, dtype=np.float32)
+
+    def step(self, action):
+        price = _to_float(self.df.iloc[self.current_step]['Close'])
+
+        # Buy/sell fixed number of shares (position >= 0, no shorting)
+        if action == 1:  # buy
+            cost = self.shares * price
+            if self.cash >= cost:
+                self.position += self.shares
+                self.cash -= cost
+        elif action == 2:  # sell
+            if self.position >= self.shares:
+                self.position -= self.shares
+                self.cash += self.shares * price
+
+        portfolio_value = self.cash + self.position * price
+
+        if self.prev_portfolio_value is None:
+            self.prev_portfolio_value = portfolio_value
+
+        if self.prev_portfolio_value != 0:
+            reward = (portfolio_value - self.prev_portfolio_value) / self.prev_portfolio_value
+        else:
+            reward = 0.0
+        self.prev_portfolio_value = portfolio_value
+
+        self.current_step += 1
+        done = self.current_step >= len(self.df) - 1
+        self.previous_price = price
+
+        return self._get_obs(), reward, done, False, {}
+
+    def render(self, mode='human'):
+        pass
+-e 
+
+================================================================================
+FILE: ./summarizer.py
+================================================================================
+
+import os
+import re
+import threading
+
+import torch
+from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
+
+from utils.utils import clean_text
+
+# ======================================================================
+# Signal extraction
+# ======================================================================
+# Company names → ticker. Extend as needed.
+_COMPANY_TO_TICKER = {
+    "apple": "AAPL", "iphone": "AAPL", "ipad": "AAPL", "macbook": "AAPL",
+    "microsoft": "MSFT", "windows": "MSFT", "azure": "MSFT",
+    "google": "GOOGL", "alphabet": "GOOGL", "android": "GOOGL",
+    "amazon": "AMZN", "aws": "AMZN",
+    "nvidia": "NVDA", "geforce": "NVDA",
+    "tesla": "TSLA", "musk": "TSLA",
+    "meta": "META", "facebook": "META", "instagram": "META", "whatsapp": "META",
+    "netflix": "NFLX",
+    "bitcoin": "BTC", "btc": "BTC",
+    "ethereum": "ETH", "eth": "ETH",
+    "solana": "SOL", "ripple": "XRP", "xrp": "XRP",
+    "citigroup": "C", "citibank": "C",
+    "visa": "V", "mastercard": "MA", "paypal": "PYPL",
+    "ford": "F", "general motors": "GM",
+    "at&t": "T", "verizon": "VZ",
+    "boeing": "BA", "lockheed": "LMT",
+    "exxon": "XOM", "chevron": "CVX",
+    "pfizer": "PFE", "moderna": "MRNA", "johnson": "JNJ",
+    "walmart": "WMT", "target": "TGT", "costco": "COST",
+    "disney": "DIS", "nike": "NKE", "starbucks": "SBUX",
+}
+
+_TICKERS = [
+    "AAPL", "MSFT", "GOOGL", "AMZN", "NVDA", "TSLA", "META", "NFLX",
+    "ADBE", "CRM", "ORCL", "IBM", "INTC", "CSCO", "AMD", "QCOM",
+    "TXN", "AVGO", "MU", "NXP",
+    "JPM", "BAC", "WFC", "C", "GS", "MS", "V", "MA", "PYPL",
+    "AXP", "COF", "PNC", "USB", "TFC",
+    "JNJ", "UNH", "PFE", "MRK", "ABBV", "AMGN", "MDT", "ISRG",
+    "TMO", "DHR", "ABT", "LLY", "BMY", "GILD",
+    "WMT", "PG", "KO", "PEP", "DIS", "NKE", "MCD", "SBUX",
+    "HD", "LOW", "TGT", "COST", "CVS", "WBA",
+    "GE", "BA", "CAT", "DE", "HON", "UPS", "FDX", "MMM",
+    "XOM", "CVX", "COP", "EOG", "SLB",
+    "BTC", "ETH", "SOL", "ADA", "DOT", "AVAX",
+]
+
+# Only tickers with length >= 2 are safe for substring matching
+_SAFE_TICKERS = [t for t in _TICKERS if len(t) >= 2]
+_SAFE_TICKER_SET = set(_SAFE_TICKERS)
+
+_BUY_WORDS = [
+    "buy", "long", "bullish", "upside", "breakout",
+    "accumulate", "buying", "rally", "outperform", "overweight",
+    "покупать", "покупка", "купить", "лонг",
+]
+_SELL_WORDS = [
+    "sell", "short", "bearish", "downside", "breakdown",
+    "distribute", "selling", "drop", "underperform", "underweight",
+    "продавать", "продажа", "продать", "шорт",
+]
+
+
+def extract_signal(summary):
+    """
+    Extract ticker and action (buy/sell/hold) from a summary.
+
+    Priority:
+      1. Explicit $TICKER or #TICKER notation (most reliable)
+      2. Word-boundary match against a whitelist of >= 2-char tickers
+      3. Company-name -> ticker dictionary
+    """
+    text = summary or ""
+    upper = text.upper()
+    lower = text.lower()
+
+    found_ticker = None
+
+    # 1. $TICKER / #TICKER notation
+    m = re.search(r"[$#]([A-Z]{2,5})\b", upper)
+    if m:
+        candidate = m.group(1)
+        if candidate in _SAFE_TICKER_SET or (2 <= len(candidate) <= 5):
+            found_ticker = candidate
+
+    # 2. Word-boundary match on whitelist
+    if found_ticker is None:
+        for t in _SAFE_TICKERS:
+            if re.search(rf"\b{re.escape(t)}\b", upper):
+                found_ticker = t
+                break
+
+    # 3. Company-name fallback
+    if found_ticker is None:
+        for name, ticker in _COMPANY_TO_TICKER.items():
+            if re.search(rf"\b{re.escape(name)}\b", lower):
+                found_ticker = ticker
+                break
+
+    # 4. Action from keyword lists
+    action = "hold"
+    if any(re.search(rf"\b{re.escape(w)}\b", lower) for w in _BUY_WORDS):
+        action = "buy"
+    elif any(re.search(rf"\b{re.escape(w)}\b", lower) for w in _SELL_WORDS):
+        action = "sell"
+
+    return found_ticker, action
+
+
+# ======================================================================
+# Summariser model management
+# ======================================================================
+def get_default_model_path():
+    """Find the most recent merged model in ./models/ directory."""
+    models_dir = "./models"
+    if os.path.exists(models_dir):
+        dirs = [os.path.join(models_dir, d) for d in os.listdir(models_dir)
+                if os.path.isdir(os.path.join(models_dir, d))]
+        if dirs:
+            dirs.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+            for d in dirs:
+                merged = os.path.join(d, "merged")
+                if os.path.exists(merged):
+                    return merged
+    fallback = "./models/english_lora_20260908_010129/merged"
+    if os.path.exists(fallback):
+        return fallback
+    return None
+
+
+_MODEL_PATH = get_default_model_path()
+if _MODEL_PATH is None:
+    raise RuntimeError(
+        "No trained summarisation model found. Please train a model first."
+    )
+
+_tokenizer = None
+_model = None
+_summarizer_lock = threading.RLock()
+
+
+def set_model_path(path):
+    """Idempotent model path setter - no-op if same path is already loaded."""
+    global _MODEL_PATH, _tokenizer, _model
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Model path does not exist: {path}")
+
+    with _summarizer_lock:
+        if _MODEL_PATH == path and _tokenizer is not None and _model is not None:
+            return
+        print(f"[summarizer] Setting model path to: {path}")
+        _MODEL_PATH = path
+        _tokenizer = None
+        _model = None
+
+
+def load_summarizer():
+    """Load tokenizer and model from _MODEL_PATH. Thread-safe."""
+    global _tokenizer, _model
+    with _summarizer_lock:
+        if _tokenizer is not None and _model is not None:
+            return
+        print(f"[summarizer] Loading summarizer from {_MODEL_PATH}")
+        try:
+            tok = AutoTokenizer.from_pretrained(_MODEL_PATH)
+            mdl = AutoModelForSeq2SeqLM.from_pretrained(_MODEL_PATH)
+            if torch.backends.mps.is_available():
+                mdl.to("mps")
+            else:
+                mdl.to("cpu")
+            mdl.eval()
+            _tokenizer = tok
+            _model = mdl
+            print("[summarizer] Load successful.")
+        except Exception as e:
+            _tokenizer = None
+            _model = None
+            raise RuntimeError(
+                f"Failed to load summarisation model from {_MODEL_PATH}: {e}"
+            )
+
+
+def summarize_post(post_text):
+    """Summarise a post using the currently loaded model."""
+    load_summarizer()
+
+    tokenizer = _tokenizer
+    model = _model
+    if tokenizer is None or model is None:
+        raise RuntimeError("Summariser not properly initialised.")
+
+    cleaned = clean_text(post_text)
+    input_text = "summarize: " + cleaned
+    inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=384)
+    device = next(model.parameters()).device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=50,
+            num_beams=5,
+            early_stopping=True,
+            no_repeat_ngram_size=4,
+            repetition_penalty=1.5,
+        )
+    summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return summary
+
+
+def get_summary_for_model(post_text, model_path):
+    """Load a specific model and summarise a post (isolated from globals)."""
+    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_path)
+    if torch.backends.mps.is_available():
+        model.to("mps")
+    else:
+        model.to("cpu")
+    model.eval()
+
+    cleaned = clean_text(post_text)
+    input_text = "summarize: " + cleaned
+    inputs = tokenizer(input_text, return_tensors="pt", truncation=True, max_length=384)
+    device = next(model.parameters()).device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=50,
+            num_beams=5,
+            early_stopping=True,
+            no_repeat_ngram_size=4,
+            repetition_penalty=1.5,
+        )
+    summary = tokenizer.decode(outputs[0], skip_special_tokens=True)
+    return summary
+-e 
+
+================================================================================
+FILE: ./telegram_legacy/data_scrap_tg.py
+================================================================================
+
+import asyncio
+import sqlite3
+
+import socks
+from telethon import TelegramClient
+from telethon.tl.functions.messages import GetHistoryRequest
+
+# Your credentials (already used to create the session)
+api_id = 36020350
+api_hash = '150dbc74b8eca6c4a906efaf678beb2f'
+
+# Database setup
+conn = sqlite3.connect('telegram_posts.db')
+cursor = conn.cursor()
+cursor.execute('''
+    CREATE TABLE IF NOT EXISTS posts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        channel TEXT,
+        message_id INTEGER,
+        date TEXT,
+        text TEXT,
+        UNIQUE(channel, message_id)
+    )
+''')
+conn.commit()
+
+# Public channels to scrape
+channels = [
+    'Bloomberg',
+    'TraderTVLive',
+    'macroresearch',
+    'TheFinancialExpressOnline',
+    'vanillafinancenews',
+    'TradingGainX'
+]
+
+
+async def scrape_channel(client, channel_username):
+    try:
+        entity = await client.get_entity(channel_username)
+        posts = await client(GetHistoryRequest(
+            peer=entity,
+            limit=150,
+            offset_date=None,
+            offset_id=0,
+            max_id=0,
+            min_id=0,
+            add_offset=0,
+            hash=0
+        ))
+        saved = 0
+        for msg in posts.messages:
+            if msg.message:
+                cursor.execute('''
+                    INSERT OR IGNORE INTO posts (channel, message_id, date, text)
+                    VALUES (?, ?, ?, ?)
+                ''', (channel_username, msg.id, msg.date.strftime('%Y-%m-%d %H:%M:%S'), msg.message))
+                saved += 1
+        conn.commit()
+        print(f"{channel_username}: {saved} new posts")
+    except Exception as e:
+        print(f"{channel_username}: {e}")
+
+
+async def main():
+    # Load the saved session (no phone, QR, or password needed)
+    client = TelegramClient(
+        "user_session",  # must match the session file name
+        api_id,
+        api_hash,
+        proxy=(socks.SOCKS5, "127.0.0.1", 10808)
+    )
+
+    await client.start()
+    print("Logged in automatically via saved session")
+
+    for channel in channels:
+        await scrape_channel(client, channel)
+
+    await client.disconnect()
+    print("Done. All posts saved to telegram_posts.db")
+
+
+if __name__ == '__main__':
+    asyncio.run(main())
+-e 
+
+================================================================================
+FILE: ./telegram_legacy/scraper.py
+================================================================================
+
+import sqlite3
+
+import socks
+from telethon import TelegramClient
+from telethon.tl.functions.messages import GetHistoryRequest
+
+api_id = 36020350
+api_hash = '150dbc74b8eca6c4a906efaf678beb2f'
+
+channels = [
+    'Bloomberg',
+    'TraderTVLive',
+    'macroresearch',
+    'TheFinancialExpressOnline',
+    'vanillafinancenews',
+    'TradingGainX'
+]
+
+
+async def scrape_channel(client, channel_username, conn, cursor):
+    try:
+        entity = await client.get_entity(channel_username)
+        posts = await client(GetHistoryRequest(
+            peer=entity,
+            limit=150,
+            offset_date=None,
+            offset_id=0,
+            max_id=0,
+            min_id=0,
+            add_offset=0,
+            hash=0
+        ))
+        saved = 0
+        for msg in posts.messages:
+            if msg.message:
+                cursor.execute('''
+                    INSERT OR IGNORE INTO posts (channel, message_id, date, text)
+                    VALUES (?, ?, ?, ?)
+                ''', (channel_username, msg.id, msg.date.strftime('%Y-%m-%d %H:%M:%S'), msg.message))
+                saved += 1
+        conn.commit()
+        return channel_username, saved, None
+    except Exception as e:
+        return channel_username, 0, str(e)
+
+
+async def scrape_all_channels():
+    conn = sqlite3.connect('telegram_posts.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS posts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel TEXT,
+            message_id INTEGER,
+            date TEXT,
+            text TEXT,
+            UNIQUE(channel, message_id)
+        )
+    ''')
+    conn.commit()
+
+    client = TelegramClient(
+        "user_session",
+        api_id,
+        api_hash,
+        proxy=(socks.SOCKS5, "127.0.0.1", 10808)
+    )
+
+    await client.start()
+    results = {}
+    for channel in channels:
+        ch, saved, err = await scrape_channel(client, channel, conn, cursor)
+        results[ch] = {'saved': saved, 'error': err}
+    await client.disconnect()
+    conn.close()
+    return results
+-e 
+
+================================================================================
+FILE: ./train_model.py
+================================================================================
+
+import csv
+import json
+import os
+from datetime import datetime
+
+import evaluate
+import numpy as np
+import pandas as pd
+import torch
+from datasets import Dataset
+from peft import LoraConfig, get_peft_model, TaskType
+from transformers import (
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    Seq2SeqTrainingArguments,
+    Seq2SeqTrainer,
+    DataCollatorForSeq2Seq,
+    TrainerCallback,
+)
+
+import model_registry
+from plot_utils import plot_training_metrics
+from training_logger import TrainingLogger
+
+
+def train_english_lora(csv_path, hyperparams,
+                       output_base_dir="./models", log_dir="./logs",
+                       model_name=None, notes=""):
+    """
+    Train English T5-small with LoRA using given hyperparameters.
+
+    If model_name is provided, the resulting model is added to
+    models/registry.json so it can be referred to by name in the UI.
+
+    Returns the path to the merged model directory.
+    """
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"CSV file not found: {csv_path}")
+
+    df = pd.read_csv(csv_path, sep=";")
+    df.columns = df.columns.str.strip()
+    required_cols = ["cleaned_text", "summary"]
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"CSV missing required columns: {missing}. "
+                         f"Found: {df.columns.tolist()}")
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = os.path.join(output_base_dir, f"english_lora_{timestamp}")
+    os.makedirs(output_dir, exist_ok=True)
+    os.makedirs(log_dir, exist_ok=True)
+
+    print(f"Training run: {timestamp}")
+    print(f"Hyperparameters: {hyperparams}")
+    print(f"Output: {output_dir}")
+    if model_name:
+        print(f"Will register as: '{model_name}'")
+
+    logger = TrainingLogger(log_dir="./training_logs")
+    run_id = logger.start_run(hyperparams, len(df))
+
+    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    if torch.backends.mps.is_available():
+        print("MPS device")
+
+    df = df.dropna(subset=["summary"])
+    df = df[df["summary"].str.strip() != ""]
+    if len(df) < 2:
+        raise ValueError(f"Not enough labelled data: {len(df)} rows.")
+
+    dataset = Dataset.from_pandas(df[["cleaned_text", "summary"]])
+    dataset = dataset.train_test_split(test_size=0.2, seed=42)
+    train_data = dataset["train"]
+    val_data = dataset["test"]
+
+    model_name_hf = "t5-small"
+    tokenizer = AutoTokenizer.from_pretrained(model_name_hf)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    model = AutoModelForSeq2SeqLM.from_pretrained(model_name_hf)
+    model.config.pad_token_id = tokenizer.pad_token_id
+
+    lora_config = LoraConfig(
+        task_type=TaskType.SEQ_2_SEQ_LM,
+        r=hyperparams.get('r', 32),
+        lora_alpha=hyperparams.get('alpha', 64),
+        lora_dropout=hyperparams.get('dropout', 0.15),
+        target_modules=["q", "v", "k", "o", "wi", "wo"],
+    )
+    model = get_peft_model(model, lora_config)
+    model.to(device)
+    model.print_trainable_parameters()
+
+    def preprocess_function(examples):
+        inputs = ["summarize: " + text for text in examples["cleaned_text"]]
+        model_inputs = tokenizer(inputs, max_length=384, truncation=True, padding=False)
+        labels = tokenizer(text_target=examples["summary"], max_length=64,
+                           truncation=True, padding=False)
+        model_inputs["labels"] = labels["input_ids"]
+        return model_inputs
+
+    tokenized_train = train_data.map(preprocess_function, batched=True,
+                                     remove_columns=["cleaned_text", "summary"])
+    tokenized_val = val_data.map(preprocess_function, batched=True,
+                                 remove_columns=["cleaned_text", "summary"])
+
+    data_collator = DataCollatorForSeq2Seq(tokenizer, model=model, padding=True)
+    rouge = evaluate.load("rouge")
+
+    def compute_metrics(eval_pred):
+        predictions, labels = eval_pred
+        predictions = predictions.cpu().numpy() if hasattr(predictions, 'cpu') else np.array(predictions)
+        labels = labels.cpu().numpy() if hasattr(labels, 'cpu') else np.array(labels)
+        vocab_size = tokenizer.vocab_size
+        predictions = np.clip(predictions, 0, vocab_size - 1).astype(np.int64)
+        labels = np.clip(labels, 0, vocab_size - 1).astype(np.int64)
+
+        decoded_preds = tokenizer.batch_decode(predictions, skip_special_tokens=True)
+        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+        decoded_preds = [p if p.strip() else "no summary" for p in decoded_preds]
+        decoded_labels = [l if l.strip() else "no summary" for l in decoded_labels]
+
+        result = rouge.compute(predictions=decoded_preds, references=decoded_labels,
+                               use_stemmer=True)
+        return {k: round(v * 100, 2) for k, v in result.items()}
+
+    class LogCallback(TrainerCallback):
+        def __init__(self, csv_filename):
+            self.csv_filename = csv_filename
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if logs:
+                logs["step"] = state.global_step
+                logs["epoch"] = state.epoch
+                with open(self.csv_filename, "a", newline="") as f:
+                    writer = csv.DictWriter(f, fieldnames=list(logs.keys()))
+                    if f.tell() == 0:
+                        writer.writeheader()
+                    writer.writerow(logs)
+
+    class SampleCallback(TrainerCallback):
+        def __init__(self, sample_text, tokenizer, model_device):
+            self.sample_text = sample_text
+            self.tokenizer = tokenizer
+            self.device = model_device
+            self.bad_words_ids = self._get_bad_words_ids()
+
+        def _get_bad_words_ids(self):
+            phrases = [
+                "Read more", "For more information", "Not financial advice",
+                "Don’t forget to like and subscribe", "Click here", "Disclaimer",
+                "This is not investment advice", "Subscribe to our newsletter",
+            ]
+            bad_ids = []
+            for phrase in phrases:
+                ids = self.tokenizer.encode(phrase, add_special_tokens=False)
+                if ids:
+                    bad_ids.append(ids)
+            return bad_ids
+
+        def on_epoch_end(self, args, state, control, **kwargs):
+            model.eval()
+            input_text = "summarize: " + self.sample_text
+            inputs = self.tokenizer(input_text, return_tensors="pt",
+                                    truncation=True, max_length=384).to(self.device)
+            with torch.no_grad():
+                outputs = model.generate(
+                    **inputs, max_new_tokens=50, num_beams=5, early_stopping=True,
+                    no_repeat_ngram_size=4, repetition_penalty=1.5,
+                    bad_words_ids=self.bad_words_ids,
+                )
+            summary = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            print(f"--- Epoch {state.epoch:.2f} sample --- \n{summary}\n")
+            model.train()
+
+    class EpochLoggerCallback(TrainerCallback):
+        def __init__(self, logger_obj, run_id):
+            self.logger = logger_obj
+            self.run_id = run_id
+
+        def on_epoch_end(self, args, state, control, logs=None, **kwargs):
+            if logs:
+                metrics = {}
+                for k_src, k_dst in [("loss", "train_loss"), ("eval_loss", "eval_loss"),
+                                     ("eval_rouge1", "eval_rouge1"),
+                                     ("eval_rougeL", "eval_rougeL"),
+                                     ("learning_rate", "learning_rate")]:
+                    if k_src in logs:
+                        metrics[k_dst] = logs[k_src]
+                self.logger.log_epoch(epoch=int(state.epoch), metrics=metrics)
+
+    sample_callback = SampleCallback(val_data[0]["cleaned_text"], tokenizer, device)
+    epoch_logger_callback = EpochLoggerCallback(logger, run_id)
+
+    training_args = Seq2SeqTrainingArguments(
+        output_dir=output_dir,
+        num_train_epochs=hyperparams.get('num_epochs', 15),
+        per_device_train_batch_size=hyperparams.get('batch_size', 2),
+        per_device_eval_batch_size=hyperparams.get('batch_size', 2),
+        learning_rate=hyperparams.get('learning_rate', 5e-4),
+        weight_decay=0.01,
+        lr_scheduler_type="cosine",
+        warmup_steps=10,
+        predict_with_generate=True,
+        logging_steps=5,
+        logging_first_step=True,
+        save_strategy="no",
+        eval_strategy="epoch",
+        report_to="none",
+        dataloader_pin_memory=False,
+        fp16=False,
+        label_smoothing_factor=0.1,
+    )
+
+    trainer = Seq2SeqTrainer(
+        model=model,
+        args=training_args,
+        train_dataset=tokenized_train,
+        eval_dataset=tokenized_val,
+        processing_class=tokenizer,
+        data_collator=data_collator,
+        compute_metrics=compute_metrics,
+        callbacks=[
+            LogCallback(os.path.join(log_dir, f"training_log_{timestamp}.csv")),
+            sample_callback,
+            epoch_logger_callback,
+        ],
+    )
+
+    print("Starting LoRA training...")
+    trainer.train()
+
+    eval_results = trainer.evaluate()
+    print("Evaluation results:", eval_results)
+
+    merged_model = model.merge_and_unload()
+    merged_output_dir = os.path.join(output_dir, "merged")
+    os.makedirs(merged_output_dir, exist_ok=True)
+    merged_model.save_pretrained(merged_output_dir)
+    tokenizer.save_pretrained(merged_output_dir)
+
+    metrics = {
+        'hyperparams': hyperparams,
+        'rouge': eval_results,
+        'training_loss': [log.get('loss') for log in trainer.state.log_history
+                          if 'loss' in log and log['loss'] is not None],
+        'timestamp': timestamp,
+    }
+    with open(os.path.join(output_dir, "metrics.json"), "w") as f:
+        json.dump(metrics, f, indent=2)
+
+    logger.log_final(eval_results, merged_output_dir)
+
+    try:
+        plot_paths = plot_training_metrics(run_id, output_dir)
+        metrics["plot_paths"] = plot_paths
+        with open(os.path.join(output_dir, "metrics.json"), "w") as f:
+            json.dump(metrics, f, indent=2)
+    except Exception as e:
+        print(f"Could not generate plots: {e}")
+
+    # ----- Register in the named-model registry -----
+    if model_name:
+        rouge_metrics = {k: v for k, v in eval_results.items() if k.startswith("eval_rouge")}
+        # Strip eval_ prefix for cleaner keys
+        rouge_clean = {k.replace("eval_", ""): v for k, v in rouge_metrics.items()}
+        ok, msg = model_registry.register(
+            name=model_name,
+            path=merged_output_dir,
+            hyperparams=hyperparams,
+            metrics=rouge_clean,
+            notes=notes,
+            overwrite=False,
+        )
+        if ok:
+            print(f"{msg}")
+        else:
+            print(f"Registry: {msg}. Model still usable by directory name.")
+
+    print(f"Model saved to {merged_output_dir}")
+    return merged_output_dir
+-e 
+
+================================================================================
+FILE: ./train_rl_agent.py
+================================================================================
+
+"""
+Train the DQN trading agent using corpus-based signals.
+
+Sources (both must exist; missing ones are skipped):
+    eulerpool_corpus.csv   -- Finnhub news, 80 tickers x 365 days
+    rss_corpus.csv         -- RSS feed headlines + bodies
+
+Signal generation:
+    action  <- extract_signal(headline)         (buy / sell / hold)
+    ticker  <- CSV 'ticker' column, fallback to extract_signal
+    signal  <- composite(analyst_signed, finbert_signed) in {-1, 0, +1}
+
+NOTE: signals are keyed by (date, ticker), not by date alone. Using just
+the date caused later articles on the same day to overwrite earlier ones,
+which collapsed the effective signal set to a handful of days.
+"""
+import json
+import os
+from datetime import datetime, timedelta
+
+import pandas as pd
+from tqdm import tqdm
+
+from RL.backtest import run_backtest
+from RL.rl_agent import DQNAgent
+from RL.rl_env import TradingEnv
+from market_data import get_market_data, compute_features
+from summarizer import extract_signal
+
+try:
+    import finbert_signal
+
+    _FINBERT_OK = True
+except Exception as e:
+    print(f"[finbert] not available: {e}")
+    _FINBERT_OK = False
+
+CONFIG = {
+    'corpus_paths': ['eulerpool_corpus.csv', 'rss_corpus.csv'],
+    'start_date': (datetime.now() - timedelta(days=365 * 2)).strftime('%Y-%m-%d'),
+    'end_date': datetime.now().strftime('%Y-%m-%d'),
+    'train_split': 0.8,
+    'episodes': 30,
+    'batch_size': 32,
+    'lr': 1e-3,
+    'gamma': 0.99,
+    'epsilon_decay': 0.995,
+    'target_update': 10,
+}
+
+
+def _analyst_to_signed(action):
+    return {'buy': 1, 'sell': -1}.get(action.lower(), 0)
+
+
+def _parse_published(value):
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return None
+    try:
+        ts = int(value)
+        if ts > 10_000_000_000:
+            ts = ts / 1000
+        return datetime.fromtimestamp(ts).date()
+    except (ValueError, TypeError):
+        pass
+    try:
+        return pd.to_datetime(value, utc=True).date()
+    except Exception:
+        return None
+
+
+def _pick_column(df, candidates):
+    for c in candidates:
+        if c in df.columns:
+            return c
+    return None
+
+
+def _load_all_corpora():
+    frames = []
+    for path in CONFIG['corpus_paths']:
+        if not os.path.exists(path):
+            print(f"{path} not found, skipping")
+            continue
+        df = pd.read_csv(path, sep=';')
+        if df.empty:
+            continue
+        print(f"{path}: {len(df)} rows")
+        frames.append(df)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def train_rl():
+    print("=" * 60)
+    print("Training RL Agent (corpus-based signals)")
+    print("=" * 60)
+
+    print("Loading corpora...")
+    df = _load_all_corpora()
+    if df.empty:
+        print("No corpus data. Run build_corpus.py and/or build_rss_corpus.py.")
+        return
+    print(f"Total rows: {len(df)}")
+    print(f"Columns: {list(df.columns)}")
+
+    headline_col = _pick_column(df, ['headline', 'title', 'summary'])
+    ticker_col = _pick_column(df, ['ticker', 'symbol'])
+    date_col = _pick_column(df, ['published', 'datetime', 'date'])
+    body_col = _pick_column(df, ['content', 'body', 'text', 'cleaned_text'])
+
+    if headline_col is None or date_col is None:
+        print(f"Missing headline or date column. Have: {list(df.columns)}")
+        return
+
+    print(f"headline='{headline_col}', ticker='{ticker_col}', "
+          f"date='{date_col}', body='{body_col}'")
+
+    if _FINBERT_OK:
+        print("FinBERT sentiment enabled — building composite signal.")
+
+    # --- Generate signals keyed by (date, ticker) ---
+    signals = {}  # (date, ticker) -> action_val
+    n_from_meta, n_from_signal = 0, 0
+
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Generating signals"):
+        date = _parse_published(row.get(date_col))
+        if date is None:
+            continue
+
+        headline = str(row.get(headline_col, "") or "").strip()
+        if not headline:
+            continue
+
+        _, action = extract_signal(headline)
+
+        ticker = None
+        if ticker_col is not None:
+            ticker = str(row.get(ticker_col, "") or "").strip().upper() or None
+
+        if ticker is not None:
+            n_from_meta += 1
+        else:
+            ticker, action_from_headline = extract_signal(headline)
+            if ticker is None and body_col is not None:
+                body_text = str(row.get(body_col, "") or "")
+                ticker, action_from_body = extract_signal(body_text)
+                if action == "hold":
+                    action = action_from_body
+            if ticker is not None:
+                n_from_signal += 1
+
+        if ticker is None:
+            continue
+
+        analyst_signed = _analyst_to_signed(action)
+
+        finbert_signed = 0
+        if _FINBERT_OK:
+            try:
+                _, finbert_signed, _ = finbert_signal.score(headline)
+            except Exception:
+                finbert_signed = 0
+
+        composite = int(round((analyst_signed + finbert_signed) / 2))
+        composite = max(-1, min(1, composite))
+        action_val = {-1: 2, 0: 0, 1: 1}[composite]
+
+        # KEYED BY (date, ticker) - multiple tickers per day are preserved
+        signals[(date, ticker)] = action_val
+
+    n_dates = len(set(d for d, _ in signals.keys()))
+    n_pairs = len(signals)
+    print(f"Generated {n_pairs} (date, ticker) signal pairs across {n_dates} "
+          f"dates ({n_from_meta} from CSV ticker, {n_from_signal} from NLP).")
+
+    if not signals:
+        print("No signals produced. Aborting.")
+        return
+
+    ticker_counts = {}
+    for (_, ticker), _ in signals.items():
+        ticker_counts[ticker] = ticker_counts.get(ticker, 0) + 1
+    print(f"Top tickers: {sorted(ticker_counts.items(), key=lambda x: -x[1])[:8]}")
+    main_ticker = max(ticker_counts, key=ticker_counts.get)
+    print(f"Most frequent ticker: {main_ticker}")
+
+    # --- Market data ---
+    df_market = get_market_data(main_ticker, CONFIG['start_date'], CONFIG['end_date'])
+    if df_market is None or df_market.empty:
+        print(f"No market data for {main_ticker}. Aborting.")
+        return
+    df_feat = compute_features(df_market)
+
+    # Align only main_ticker signals to trading days
+    signal_series = []
+    for date in df_feat.index:
+        d = date.date()
+        signal_series.append(signals.get((d, main_ticker), 0))
+    df_feat['signal'] = signal_series
+
+    n_signal = sum(1 for s in signal_series if s != 0)
+    n_hold = len(signal_series) - n_signal
+    print(f"Market data: {df_feat.shape}  "
+          f"({n_signal} signal-days, {n_hold} hold-days) for {main_ticker}")
+
+    # --- Split ---
+    split_idx = int(len(df_feat) * CONFIG['train_split'])
+    train_df = df_feat.iloc[:split_idx].copy()
+    test_df = df_feat.iloc[split_idx:].copy()
+    train_df.to_pickle('rl_train_set.pkl')
+    test_df.to_pickle('rl_test_set.pkl')
+    with open('rl_main_ticker.txt', 'w') as f:
+        f.write(main_ticker)
+    print(f"Saved splits  ({len(train_df)}/{len(test_df)} bars)")
+
+    # --- Train ---
+    agent = DQNAgent(
+        state_dim=7, action_dim=3,
+        lr=CONFIG['lr'], gamma=CONFIG['gamma'],
+        epsilon_decay=CONFIG['epsilon_decay'],
+        batch_size=CONFIG['batch_size'],
+        target_update=CONFIG['target_update'],
+    )
+
+    env = TradingEnv(train_df, train_df['signal'], initial_cash=10000, shares=100)
+    print(f"\nTraining for {CONFIG['episodes']} episodes...")
+    for ep in range(CONFIG['episodes']):
+        state, _ = env.reset()
+        done = False
+        total_reward = 0.0
+        while not done:
+            action = agent.act(state)
+            next_state, reward, done, _, _ = env.step(action)
+            agent.remember(state, action, reward, next_state, done)
+            agent.replay()
+            state = next_state
+            total_reward += reward
+        if (ep + 1) % 5 == 0 or ep == 0:
+            print(f"Episode {ep + 1}: reward={total_reward:.4f}")
+
+    agent.save('dqn_model.pth')
+    print("\nAgent saved to dqn_model.pth")
+
+    print("Backtesting...")
+    results = run_backtest(agent, test_df, test_df['signal'], initial_cash=10000)
+    print(f"Results: {results}")
+    with open('rl_training_metrics.json', 'w') as f:
+        json.dump(results, f, indent=2)
+
+
+if __name__ == "__main__":
+    train_rl()
+-e 
+
+================================================================================
+FILE: ./training_logger.py
+================================================================================
+
+import json
+import os
+from datetime import datetime
+from typing import Dict, List, Any
+
+import pandas as pd
+
+
+class TrainingLogger:
+    """Comprehensive training logger for summarisation models."""
+
+    def __init__(self, log_dir: str = "./training_logs"):
+        self.log_dir = log_dir
+        os.makedirs(log_dir, exist_ok=True)
+        self.current_run = None
+
+    def start_run(self, hyperparams: Dict[str, Any], dataset_size: int):
+        """Start a new training run."""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.current_run = {
+            "run_id": timestamp,
+            "hyperparameters": hyperparams,
+            "dataset_size": dataset_size,
+            "start_time": datetime.now().isoformat(),
+            "epochs": [],
+            "final_metrics": None,
+            "sample_outputs": []
+        }
+        # Create run directory
+        self.run_dir = os.path.join(self.log_dir, timestamp)
+        os.makedirs(self.run_dir, exist_ok=True)
+        return timestamp
+
+    def log_epoch(self, epoch: int, metrics: Dict[str, float], sample_summary: str = None):
+        """Log metrics for a single epoch."""
+        if self.current_run is None:
+            raise ValueError("No active training run")
+
+        epoch_data = {
+            "epoch": epoch,
+            "timestamp": datetime.now().isoformat(),
+            **metrics
+        }
+        self.current_run["epochs"].append(epoch_data)
+
+        if sample_summary:
+            self.current_run["sample_outputs"].append({
+                "epoch": epoch,
+                "summary": sample_summary,
+                "timestamp": datetime.now().isoformat()
+            })
+
+        # Write epoch log to CSV
+        epoch_file = os.path.join(self.run_dir, f"epoch_{epoch:03d}.csv")
+        pd.DataFrame([epoch_data]).to_csv(epoch_file, index=False)
+
+        # Update the full log
+        self._save_current_run()
+
+    def log_final(self, metrics: Dict[str, float], model_path: str):
+        """Log final metrics after training completes."""
+        if self.current_run is None:
+            raise ValueError("No active training run")
+
+        self.current_run["final_metrics"] = metrics
+        self.current_run["model_path"] = model_path
+        self.current_run["end_time"] = datetime.now().isoformat()
+        self.current_run["total_epochs"] = len(self.current_run["epochs"])
+
+        # Calculate training time
+        start = datetime.fromisoformat(self.current_run["start_time"])
+        end = datetime.fromisoformat(self.current_run["end_time"])
+        self.current_run["duration_seconds"] = (end - start).total_seconds()
+
+        self._save_current_run()
+
+        # Also save a summary JSON with just the final metrics for easy access
+        summary_path = os.path.join(self.run_dir, "final_summary.json")
+        with open(summary_path, "w") as f:
+            json.dump({
+                "run_id": self.current_run["run_id"],
+                "final_metrics": metrics,
+                "model_path": model_path,
+                "hyperparameters": self.current_run["hyperparameters"],
+                "duration_seconds": self.current_run["duration_seconds"]
+            }, f, indent=2)
+
+    def _save_current_run(self):
+        """Save the current run data to JSON."""
+        if self.current_run:
+            run_file = os.path.join(self.run_dir, "full_log.json")
+            with open(run_file, "w") as f:
+                json.dump(self.current_run, f, indent=2, default=str)
+
+    def get_run_data(self, run_id: str) -> Dict[str, Any]:
+        """Retrieve data for a specific run."""
+        run_dir = os.path.join(self.log_dir, run_id)
+        run_file = os.path.join(run_dir, "full_log.json")
+        if os.path.exists(run_file):
+            with open(run_file, "r") as f:
+                return json.load(f)
+        return None
+
+    def get_all_runs(self) -> List[Dict[str, Any]]:
+        """Get summary of all training runs."""
+        runs = []
+        for run_dir in os.listdir(self.log_dir):
+            run_path = os.path.join(self.log_dir, run_dir)
+            if os.path.isdir(run_path):
+                summary_file = os.path.join(run_path, "final_summary.json")
+                if os.path.exists(summary_file):
+                    with open(summary_file, "r") as f:
+                        runs.append(json.load(f))
+                else:
+                    # Partial run - try to load from full log
+                    full_file = os.path.join(run_path, "full_log.json")
+                    if os.path.exists(full_file):
+                        with open(full_file, "r") as f:
+                            data = json.load(f)
+                            runs.append({
+                                "run_id": data.get("run_id", run_dir),
+                                "hyperparameters": data.get("hyperparameters", {}),
+                                "epochs_completed": len(data.get("epochs", [])),
+                                "status": "incomplete"
+                            })
+        return runs
+
+    def get_run_epochs_dataframe(self, run_id: str) -> pd.DataFrame:
+        """Get all epoch data for a run as a DataFrame for plotting."""
+        data = self.get_run_data(run_id)
+        if data and "epochs" in data:
+            return pd.DataFrame(data["epochs"])
+        return pd.DataFrame()
+-e 
+
+================================================================================
+FILE: ./utils/utils.py
+================================================================================
+
+import json
+import os
+import re
+import sqlite3
+from pathlib import Path
+
+import pandas as pd
+
+
+def clean_text(text):
+    if not text:
+        return ""
+    text = re.sub(r'<[^>]+>', '', text)
+    text = re.sub(r'http\S+|www\S+|https\S+', '', text)
+    text = re.sub(r'[^\w\s,.!?$%€£@#\-]', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+def get_training_ids(channel):
+    ids = set()
+    csv_path = Path('../telegram_legacy/csvs/english_channels_sample_30.csv')
+    if csv_path.exists():
+        df = pd.read_csv(csv_path, sep=';')
+        if 'id' in df.columns:
+            ids.update(df['id'].dropna().astype(int).tolist())
+    return ids
+
+
+def get_unseen_posts(channel, limit=3):
+    conn = sqlite3.connect('../telegram_legacy/telegram_posts.db')
+    cursor = conn.cursor()
+    training_ids = get_training_ids(channel)
+    if training_ids:
+        placeholders = ','.join(['?'] * len(training_ids))
+        query = (f"SELECT date, text FROM posts WHERE channel=? "
+                 f"AND id NOT IN ({placeholders}) ORDER BY date DESC LIMIT ?")
+        params = (channel,) + tuple(training_ids) + (limit,)
+    else:
+        query = "SELECT date, text FROM posts WHERE channel=? ORDER BY date DESC LIMIT ?"
+        params = (channel, limit)
+    cursor.execute(query, params)
+    rows = cursor.fetchall()
+    conn.close()
+    return rows
+
+
+def get_available_models(models_dir="./models"):
+    """Return list of merged model directories (paths only). Legacy helper."""
+    available = []
+    if os.path.exists(models_dir):
+        for d in os.listdir(models_dir):
+            merged_path = os.path.join(models_dir, d, "merged")
+            if os.path.exists(merged_path):
+                available.append(merged_path)
+    default_model = "./rut5_financial_merged_v3"
+    if os.path.exists(default_model):
+        available.append(default_model)
+    return available
+
+
+def get_named_models(models_dir="./models"):
+    """
+    Return list of dicts:
+        [{"name": ..., "path": ..., "registered": bool, "meta": {...}}, ...]
+
+    Registered models come first (newest first), then unregistered merged
+    directories (whose "name" falls back to the directory basename).
+    """
+    try:
+        import model_registry
+        registry = model_registry.list_models()
+    except Exception:
+        registry = {}
+
+    out = []
+    seen_paths = set()
+
+    # Registered models first, newest first
+    for name, meta in sorted(registry.items(),
+                             key=lambda kv: kv[1].get("created", ""),
+                             reverse=True):
+        path = meta.get("path", "")
+        if not os.path.exists(path):
+            continue
+        out.append({
+            "name": name,
+            "path": path,
+            "registered": True,
+            "meta": meta,
+        })
+        seen_paths.add(os.path.abspath(path))
+
+    # Then any unregistered merged dirs on disk
+    if os.path.exists(models_dir):
+        for d in sorted(os.listdir(models_dir), reverse=True):
+            merged = os.path.join(models_dir, d, "merged")
+            if not os.path.exists(merged):
+                continue
+            if os.path.abspath(merged) in seen_paths:
+                continue
+            out.append({
+                "name": d,  # e.g. english_lora_20260913_205244
+                "path": merged,
+                "registered": False,
+                "meta": {},
+            })
+
+    return out
+
+
+def get_model_metrics(model_path):
+    """Load metrics.json from the model's parent directory."""
+    parent_dir = os.path.dirname(model_path)
+    metrics_file = os.path.join(parent_dir, "metrics.json")
+    if os.path.exists(metrics_file):
+        with open(metrics_file, 'r') as f:
+            return json.load(f)
+    return None
+-e 
+
+================================================================================
+FILE: ./visualise_training_logs.py
+================================================================================
+
+"""
+visualise_training_logs.py
+
+Read all training_log_*.csv files from a logs directory, parse training and evaluation
+metrics (robustly handling variable row lengths), and generate comparison plots.
+
+Interactive hover in Jupyter:
+    - Install mplcursors: pip install mplcursors
+    - Use %matplotlib notebook or %matplotlib widget in your notebook
+    - Call run_visualisation(interactive=True)
+
+Usage in Jupyter:
+    from visualise_training_logs import run_visualisation
+    %matplotlib notebook
+    run_visualisation(logs_dir='logs', output_dir='plots', interactive=True)
+
+Command line:
+    python visualise_training_logs.py --logs_dir logs --output_dir plots
+"""
+
+import argparse
+import csv
+import glob
+import os
+import re
+import warnings
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import seaborn as sns
+
+# Set style
+sns.set_style("whitegrid")
+sns.set_context("talk", font_scale=1.1)
+
+
+def parse_log_file(filepath):
+    """
+    Parse a CSV log file robustly, handling variable column counts.
+    Returns two DataFrames: training rows and evaluation rows.
+    """
+    train_rows = []
+    eval_rows = []
+
+    # Extract model label from filename
+    basename = os.path.basename(filepath)
+    match = re.search(r'(\d{8}_\d{6})', basename)
+    model_label = match.group(1) if match else basename.replace('training_log_', '').replace('.csv', '')
+
+    with open(filepath, 'r') as f:
+        reader = csv.reader(f)
+        try:
+            header = next(reader)
+        except StopIteration:
+            return pd.DataFrame(), pd.DataFrame()
+
+        # Locate column indices
+        try:
+            loss_idx = header.index('loss')
+        except ValueError:
+            loss_idx = -1
+        try:
+            eval_loss_idx = header.index('eval_loss')
+        except ValueError:
+            eval_loss_idx = -1
+        try:
+            step_idx = header.index('step')
+        except ValueError:
+            step_idx = -1
+        try:
+            epoch_idx = header.index('epoch')
+        except ValueError:
+            epoch_idx = -1
+        try:
+            grad_norm_idx = header.index('grad_norm')
+        except ValueError:
+            grad_norm_idx = -1
+        try:
+            lr_idx = header.index('learning_rate')
+        except ValueError:
+            lr_idx = -1
+        try:
+            rouge1_idx = header.index('eval_rouge1')
+        except ValueError:
+            rouge1_idx = -1
+        try:
+            rougeL_idx = header.index('eval_rougeL')
+        except ValueError:
+            rougeL_idx = -1
+
+        for row in reader:
+            if len(row) < 2:
+                continue
+
+            # Check if this is an evaluation row (has eval_loss)
+            if eval_loss_idx != -1 and len(row) > eval_loss_idx and row[eval_loss_idx].strip():
+                eval_dict = {'model': model_label}
+                if step_idx != -1 and len(row) > step_idx:
+                    try:
+                        eval_dict['step'] = float(row[step_idx]) if row[step_idx].strip() else None
+                    except ValueError:
+                        pass
+                if epoch_idx != -1 and len(row) > epoch_idx:
+                    try:
+                        eval_dict['epoch'] = float(row[epoch_idx]) if row[epoch_idx].strip() else None
+                    except ValueError:
+                        pass
+                if eval_loss_idx != -1 and len(row) > eval_loss_idx:
+                    try:
+                        eval_dict['eval_loss'] = float(row[eval_loss_idx]) if row[eval_loss_idx].strip() else None
+                    except ValueError:
+                        pass
+                if rouge1_idx != -1 and len(row) > rouge1_idx:
+                    try:
+                        eval_dict['eval_rouge1'] = float(row[rouge1_idx]) if row[rouge1_idx].strip() else None
+                    except ValueError:
+                        pass
+                if rougeL_idx != -1 and len(row) > rougeL_idx:
+                    try:
+                        eval_dict['eval_rougeL'] = float(row[rougeL_idx]) if row[rougeL_idx].strip() else None
+                    except ValueError:
+                        pass
+                eval_rows.append(eval_dict)
+
+            # Otherwise, if it has a loss, treat as training row
+            elif loss_idx != -1 and len(row) > loss_idx and row[loss_idx].strip():
+                train_dict = {'model': model_label}
+                if step_idx != -1 and len(row) > step_idx:
+                    try:
+                        train_dict['step'] = float(row[step_idx]) if row[step_idx].strip() else None
+                    except ValueError:
+                        pass
+                if epoch_idx != -1 and len(row) > epoch_idx:
+                    try:
+                        train_dict['epoch'] = float(row[epoch_idx]) if row[epoch_idx].strip() else None
+                    except ValueError:
+                        pass
+                if loss_idx != -1 and len(row) > loss_idx:
+                    try:
+                        train_dict['loss'] = float(row[loss_idx]) if row[loss_idx].strip() else None
+                    except ValueError:
+                        pass
+                if grad_norm_idx != -1 and len(row) > grad_norm_idx:
+                    try:
+                        train_dict['grad_norm'] = float(row[grad_norm_idx]) if row[grad_norm_idx].strip() else None
+                    except ValueError:
+                        pass
+                if lr_idx != -1 and len(row) > lr_idx:
+                    try:
+                        train_dict['learning_rate'] = float(row[lr_idx]) if row[lr_idx].strip() else None
+                    except ValueError:
+                        pass
+                train_rows.append(train_dict)
+
+    train_df = pd.DataFrame(train_rows)
+    eval_df = pd.DataFrame(eval_rows)
+
+    # Drop rows where all relevant numeric columns are NaN
+    if not train_df.empty:
+        train_df = train_df.dropna(subset=['loss', 'step', 'epoch'], how='all')
+    if not eval_df.empty:
+        eval_df = eval_df.dropna(subset=['eval_loss', 'epoch'], how='all')
+
+    return train_df, eval_df
+
+
+def _add_hover_cursor(ax, label_field='model'):
+    """Add mplcursors hover tooltip showing model name."""
+    try:
+        import mplcursors
+        # Add cursor to all lines in the axes
+        for line in ax.get_lines():
+            # We want to show the model label for each point; but the label is constant per line.
+            # We'll show the line label on hover.
+            cursor = mplcursors.cursor(line, hover=True)
+            cursor.connect("add", lambda sel: sel.annotation.set_text(sel.artist.get_label()))
+        return True
+    except ImportError:
+        warnings.warn("mplcursors not installed. Install with 'pip install mplcursors' for hover tooltips.")
+        return False
+
+
+def plot_training_loss(train_dfs, output_dir, interactive=False):
+    """Plot training loss (per step) for all models."""
+    fig, ax = plt.subplots(figsize=(12, 6))
+    for df in train_dfs:
+        df_sorted = df.sort_values('step')
+        ax.plot(df_sorted['step'], df_sorted['loss'], label=df_sorted['model'].iloc[0], linewidth=2)
+
+    ax.set_xlabel('Training Step')
+    ax.set_ylabel('Training Loss')
+    ax.set_title('Training Loss per Step')
+    ax.legend(loc='upper right')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'training_loss_vs_step.png'), dpi=150)
+    if interactive:
+        _add_hover_cursor(ax)
+    plt.show()
+    plt.close()
+
+
+def plot_training_loss_vs_epoch(train_dfs, output_dir, interactive=False):
+    """Plot training loss vs epoch (averaged per epoch)."""
+    fig, ax = plt.subplots(figsize=(12, 6))
+    for df in train_dfs:
+        epoch_loss = df.groupby('epoch')['loss'].mean().reset_index()
+        ax.plot(epoch_loss['epoch'], epoch_loss['loss'], marker='o', label=df['model'].iloc[0])
+
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Training Loss (mean per epoch)')
+    ax.set_title('Training Loss per Epoch')
+    ax.legend(loc='upper right')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'training_loss_vs_epoch.png'), dpi=150)
+    if interactive:
+        _add_hover_cursor(ax)
+    plt.show()
+    plt.close()
+
+
+def plot_eval_loss(eval_dfs, output_dir, interactive=False):
+    """Plot validation loss vs epoch."""
+    fig, ax = plt.subplots(figsize=(12, 6))
+    for df in eval_dfs:
+        df_sorted = df.sort_values('epoch')
+        ax.plot(df_sorted['epoch'], df_sorted['eval_loss'], marker='o', label=df_sorted['model'].iloc[0])
+
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Validation Loss')
+    ax.set_title('Validation Loss per Epoch')
+    ax.legend(loc='upper right')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'validation_loss.png'), dpi=150)
+    if interactive:
+        _add_hover_cursor(ax)
+    plt.show()
+    plt.close()
+
+
+def plot_rouge_scores(eval_dfs, output_dir, interactive=False):
+    """Plot ROUGE-1 and ROUGE-L scores vs epoch."""
+    has_rouge = any(all(col in df.columns for col in ['eval_rouge1', 'eval_rougeL']) for df in eval_dfs)
+    if not has_rouge:
+        print("No ROUGE columns found in evaluation logs. Skipping ROUGE plots.")
+        return
+
+    # ROUGE-1
+    fig, ax = plt.subplots(figsize=(12, 6))
+    for df in eval_dfs:
+        if 'eval_rouge1' in df.columns:
+            df_sorted = df.sort_values('epoch')
+            ax.plot(df_sorted['epoch'], df_sorted['eval_rouge1'], marker='o', label=df_sorted['model'].iloc[0])
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('ROUGE-1')
+    ax.set_title('ROUGE-1 Score per Epoch')
+    ax.legend(loc='lower right')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'rouge1.png'), dpi=150)
+    if interactive:
+        _add_hover_cursor(ax)
+    plt.show()
+    plt.close()
+
+    # ROUGE-L
+    fig, ax = plt.subplots(figsize=(12, 6))
+    for df in eval_dfs:
+        if 'eval_rougeL' in df.columns:
+            df_sorted = df.sort_values('epoch')
+            ax.plot(df_sorted['epoch'], df_sorted['eval_rougeL'], marker='o', label=df_sorted['model'].iloc[0])
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('ROUGE-L')
+    ax.set_title('ROUGE-L Score per Epoch')
+    ax.legend(loc='lower right')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'rougeL.png'), dpi=150)
+    if interactive:
+        _add_hover_cursor(ax)
+    plt.show()
+    plt.close()
+
+
+def plot_grad_norm(train_dfs, output_dir, interactive=False):
+    """Plot gradient norm vs step."""
+    has_grad = any('grad_norm' in df.columns for df in train_dfs)
+    if not has_grad:
+        print("No gradient norm data found. Skipping grad_norm plot.")
+        return
+    fig, ax = plt.subplots(figsize=(12, 6))
+    for df in train_dfs:
+        if 'grad_norm' in df.columns:
+            df_sorted = df.sort_values('step')
+            ax.plot(df_sorted['step'], df_sorted['grad_norm'], label=df_sorted['model'].iloc[0])
+    ax.set_xlabel('Training Step')
+    ax.set_ylabel('Gradient Norm')
+    ax.set_title('Gradient Norm per Step')
+    ax.legend(loc='upper right')
+    ax.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(os.path.join(output_dir, 'grad_norm.png'), dpi=150)
+    if interactive:
+        _add_hover_cursor(ax)
+    plt.show()
+    plt.close()
+
+
+def run_visualisation(logs_dir='logs', output_dir='plots', interactive=False):
+    """
+    Main function to parse logs and generate plots.
+    If interactive=True, attempts to add hover tooltips (requires mplcursors).
+    For full interactivity in Jupyter, use %matplotlib notebook or %matplotlib widget.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+
+    log_files = glob.glob(os.path.join(logs_dir, 'training_log_*.csv'))
+    if not log_files:
+        print(f"No training_log_*.csv files found in {logs_dir}")
+        return
+
+    print(f"Found {len(log_files)} log files.")
+
+    train_dfs = []
+    eval_dfs = []
+    for f in log_files:
+        try:
+            train, eval_ = parse_log_file(f)
+            if not train.empty:
+                train_dfs.append(train)
+            if not eval_.empty:
+                eval_dfs.append(eval_)
+        except Exception as e:
+            print(f"Error parsing {f}: {e}")
+
+    if not train_dfs and not eval_dfs:
+        print("No valid data found.")
+        return
+
+    # Generate plots (saved to files and shown)
+    if train_dfs:
+        plot_training_loss(train_dfs, output_dir, interactive)
+        plot_training_loss_vs_epoch(train_dfs, output_dir, interactive)
+        plot_grad_norm(train_dfs, output_dir, interactive)
+    if eval_dfs:
+        plot_eval_loss(eval_dfs, output_dir, interactive)
+        plot_rouge_scores(eval_dfs, output_dir, interactive)
+
+    print(f"Plots saved to {output_dir}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Visualise training logs from multiple models.')
+    parser.add_argument('--logs_dir', type=str, default='logs',
+                        help='Directory containing training_log_*.csv files (default: logs)')
+    parser.add_argument('--output_dir', type=str, default='plots',
+                        help='Directory to save plots (default: plots)')
+    parser.add_argument('--interactive', action='store_true',
+                        help='Enable interactive hover tooltips (requires mplcursors)')
+    args = parser.parse_args()
+    run_visualisation(logs_dir=args.logs_dir, output_dir=args.output_dir, interactive=args.interactive)
+
+
+if __name__ == '__main__':
+    main()
+-e 
+
+================================================================================
+FILE: ./walkforward.py
+================================================================================
+
+"""
+Walk-forward validation for the RL trading agent.
+
+Splits the price history into N folds. For each fold k:
+    train on bars [0 .. split_k)
+    test on bars [split_k .. split_{k+1})
+
+The trading agent is RE-TRAINED from scratch for each fold (from a fresh
+network), so this measures generalisation rather than in-sample fit.
+
+Outputs walkforward_results.csv with one row per fold.
+"""
+import os
+
+import numpy as np
+import pandas as pd
+
+from RL.backtest import run_backtest
+from RL.rl_agent import DQNAgent
+from RL.rl_env import TradingEnv
+from market_data import get_market_data, compute_features
+
+TICKER_FILE = "rl_main_ticker.txt"
+START = "2023-01-01"  # adjust to your history
+END = None
+N_FOLDS = 4
+EPISODES = 20
+STATE_DIM = 7
+ACTION_DIM = 3
+SEED = 42
+
+
+def _train_one_fold(train_df, agent_kwargs):
+    np.random.seed(SEED)
+    agent = DQNAgent(state_dim=STATE_DIM, action_dim=ACTION_DIM, **agent_kwargs)
+    env = TradingEnv(train_df, train_df['signal'], initial_cash=10000, shares=100)
+    for _ in range(EPISODES):
+        state, _ = env.reset()
+        done = False
+        while not done:
+            action = agent.act(state)
+            nxt, reward, done, _, _ = env.step(action)
+            agent.remember(state, action, reward, nxt, done)
+            agent.replay()
+            state = nxt
+    return agent
+
+
+def main():
+    # at the top of walkforward.py's main(), replace the open() block with:
+
+    def _get_ticker():
+        if os.path.exists(TICKER_FILE):
+            with open(TICKER_FILE) as f:
+                return f.read().strip()
+        # Fallback: most-frequent ticker from the training corpus
+        try:
+            df = pd.read_csv("training_corpus_large.csv", sep=';')
+            # In the absence of a ticker column, pick a sensible default
+            return "AAPL"
+        except Exception:
+            return "AAPL"
+
+    ticker = _get_ticker()
+    print(f"Walk-forward on {ticker}, {N_FOLDS} folds, {EPISODES} episodes each")
+
+    df = get_market_data(ticker, START, END)
+    df_feat = compute_features(df)
+    n = len(df_feat)
+
+    # Expanding windows: first fold trains on 50% of data, last on 80%
+    train_fracs = np.linspace(0.5, 0.8, N_FOLDS)
+
+    rows = []
+    for i, frac in enumerate(train_fracs, 1):
+        split = int(n * frac)
+        test_end = min(split + int(n * 0.1), n)  # 10% test window
+        train = df_feat.iloc[:split].copy()
+        test = df_feat.iloc[split:test_end].copy()
+        # Signals: reuse whatever composite signal is already in the frame
+        # (for this script, use a neutral signal — the goal is to measure
+        # the RL policy's robustness across folds)
+        train['signal'] = 0
+        test['signal'] = 0
+
+        print(f"Fold {i}: train {len(train)} bars, test {len(test)} bars")
+        agent = _train_one_fold(train, {
+            'lr': 1e-3, 'gamma': 0.99, 'epsilon_decay': 0.995,
+            'batch_size': 32, 'target_update': 10,
+        })
+        res = run_backtest(agent, test, test['signal'], initial_cash=10000)
+        rows.append({
+            "fold": i,
+            "train_bars": len(train),
+            "test_bars": len(test),
+            "return_pct": res["total_return"],
+            "sharpe": res["sharpe_ratio"] if res["sharpe_ratio"] is not None else 0.0,
+            "max_dd": res["max_drawdown"],
+        })
+        print(f"return={res['total_return']:.2f}%  "
+              f"sharpe={res['sharpe_ratio']}  dd={res['max_drawdown']:.2f}%")
+
+    df_out = pd.DataFrame(rows)
+    df_out.to_csv("walkforward_results.csv", index=False)
+
+    print("================= Walk-forward summary =================")
+    print(df_out.to_string(index=False))
+    print("Mean +- std across folds:")
+    for col in ("return_pct", "sharpe", "max_dd"):
+        m, s = df_out[col].mean(), df_out[col].std()
+        print(f"{col:12s}: {m:+.3f}  ±  {s:.3f}")
+    print("Saved walkforward_results.csv")
+
+
+if __name__ == "__main__":
+    main()
+-e 
+

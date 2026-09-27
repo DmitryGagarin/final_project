@@ -1,0 +1,5 @@
+config,return_pct,sharpe,max_dd
+"A. Summariser only (no signal, no RL)",0.0,0.0,0.0
+B. Rule-based advisor,-0.81,-0.378,-4.48
+C. Composite signal (analyst + FinBERT),-0.81,-0.378,-4.48
+D. Full pipeline (+ RL),-0.47,0.0,0.9
