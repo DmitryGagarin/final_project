@@ -151,6 +151,8 @@ You only need to run these once, and only the sources you care about.
     Or run from the web interface. Requires the telethon package, a
     valid Telegram session file, and the SOCKS5 proxy on 127.0.0.1:10808.
 
+    pip install absl-py rouge_score nltk
+
 
 ================================================================================
 5. TRAINING THE SUMMARISER
