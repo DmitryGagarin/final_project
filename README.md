@@ -1,1 +1,1 @@
-# final_project
+### use INSTRUCTIONS.txt for installation
