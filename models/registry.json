@@ -1,0 +1,42 @@
+{
+  "123123123": {
+    "path": "/Users/dmitryfatsievich/Desktop/education/LONDON/FINAL PROJECT/models/english_lora_20260913_210611/merged",
+    "created": "2026-09-13T21:23:50.288831",
+    "hyperparams": {
+      "r": 8,
+      "alpha": 8,
+      "dropout": 0.1,
+      "learning_rate": 0.00049,
+      "num_epochs": 3,
+      "batch_size": 2
+    },
+    "metrics": {
+      "rouge1": 30.49,
+      "rouge2": 13.76,
+      "rougeL": 27.53,
+      "gold_eval_path": "gold_set_v2.csv"
+    },
+    "notes": "",
+    "updated": "2026-09-13T21:27:42.762427"
+  },
+  "demonstation_model": {
+    "path": "/Users/dmitryfatsievich/Desktop/education/LONDON/FINAL PROJECT/models/english_lora_20260927_214045/merged",
+    "created": "2026-09-27T23:23:25.296384",
+    "hyperparams": {
+      "r": 12,
+      "alpha": 16,
+      "dropout": 0.05,
+      "learning_rate": 0.0005,
+      "num_epochs": 3,
+      "batch_size": 2
+    },
+    "metrics": {
+      "rouge1": 31.14,
+      "rouge2": 15.31,
+      "rougeL": 28.53,
+      "gold_eval_path": "gold_set_v2.csv"
+    },
+    "notes": "This is a model for demo purposes",
+    "updated": "2026-09-27T23:33:34.752975"
+  }
+}

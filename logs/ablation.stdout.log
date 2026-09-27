@@ -1,0 +1,12 @@
+Loaded rl_test_set.pkl: 91 bars
+Starting Portfolio Value: 10000.00
+Final Portfolio Value: 9953.09
+
+================= Ablation =================
+                                 config  return_pct  sharpe  max_dd
+  A. Summariser only (no signal, no RL)        0.00   0.000    0.00
+                  B. Rule-based advisor       -0.81  -0.378   -4.48
+C. Composite signal (analyst + FinBERT)       -0.81  -0.378   -4.48
+                D. Full pipeline (+ RL)       -0.47   0.000    0.90
+
+Saved ablation_results.csv

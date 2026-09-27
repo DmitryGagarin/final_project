@@ -1,0 +1,22 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+/Users/dmitryfatsievich/miniconda3/lib/python3.12/importlib/__init__.py:90: UserWarning: A NumPy version >=1.23.5 and <2.5.0 is required for this version of SciPy (detected version 2.5.0)
+  return _bootstrap._gcd_import(name[level:], package, level)
+
+=== mxlcw/telegram-financial-sentiment-summarization ===
+  Split: train | rows: 18107
+  Columns: ['date', 'post_url', 'text', 'summarized_text', 'regular_text_sentiment_label', 'regular_text_sentiment_score', 'summarized_text_sentiment_label', 'summarized_text_sentiment_score']
+  Using text='text', summary='regular_text_sentiment_label'
+  ✅ Saved 17889 rows → hf_raw/mxlcw__telegram-financial-sentiment-summarization.csv
+
+=== bruhwalkk/economic-telegram-news-corpus-2025 ===
+  Split: train | rows: 31292
+  Columns: ['Unnamed: 0', 'message_id', 'id_channel', 'message', 'viral_final', 'is_economic', 'economic_topic', 'topic_confidence', 'channel_name', 'channel_w', 'message_vector', 'subscribers', 'date', 'date_day']
+  ❌ Could not auto-detect text/summary columns (text=message, summary=None). Skipping.
+
+=== ZombitX64/telegram-financial-signalsv2 ===
+  Split: train | rows: 4664
+  Columns: ['symbol', 'action', 'sentiment', 'entry_price', 'target', 'stop_loss', 'timestamp', 'text', 'sentiment_int', 'image', 'time_frame']
+  Using text='text', summary='target'
+  ✅ Saved 3953 rows → hf_raw/ZombitX64__telegram-financial-signalsv2.csv
+
+✅ Combined HuggingFace corpus: 21836 rows → hf_telegram_corpus.csv
